@@ -7,12 +7,13 @@
 // Card emulation/listen mode is not wired in this driver yet.
 // ISO15693 writes are not implemented.
 
+#include "core/bus_HAL.h"
 #include "core/sd_functions.h"
 #include "modules/rfid/apdu.h"
 #include <esp_random.h>
 #include <globals.h>
 
-#define ST25R_DEBUG 1
+// #define ST25R_DEBUG 1
 #if ST25R_DEBUG
 #define ST25R_LOG(fmt, ...) Serial.printf("[ST25R] " fmt "\n", ##__VA_ARGS__)
 #else
@@ -60,6 +61,16 @@ static void _setNfcPower(bool enabled) {
 #if defined(IO_EXP_NFC) && IO_EXP_NFC >= 0
     ioExpander.setPinDirection(IO_EXP_NFC, OUTPUT);
     ioExpander.turnPinOnOff(IO_EXP_NFC, enabled ? HIGH : LOW);
+#endif
+#ifdef CAP_CC1101_POWER_EN
+    // M5Stack Cap CC1101: POWER_EN gates the whole cap, and the cap's CC1101 hangs off
+    // this same SPI bus, so park its CS high before we talk to the NFC chip.
+    if (bruceConfigPins.ST25R_bus.cs == (gpio_num_t)CAP_NFC_SS_PIN) {
+        pinMode(CAP_CC1101_SS_PIN, OUTPUT);
+        digitalWrite(CAP_CC1101_SS_PIN, HIGH);
+        pinMode(CAP_CC1101_POWER_EN, OUTPUT);
+        digitalWrite(CAP_CC1101_POWER_EN, enabled ? HIGH : LOW);
+    }
 #endif
 }
 
@@ -223,28 +234,12 @@ bool ST25R3916::_initSPI() {
         (int)bruceConfigPins.ST25R_bus.sck
     );
 
-    if (bruceConfigPins.ST25R_bus.mosi == (gpio_num_t)TFT_MOSI &&
-        bruceConfigPins.ST25R_bus.mosi != GPIO_NUM_NC) {
-#if TFT_MOSI >= 0
-        ST25R_LOG("_initSPI: sharing TFT SPI");
-        _spi = &tft.getSPIinstance();
-#endif
-    } else if (bruceConfigPins.ST25R_bus.mosi == bruceConfigPins.SDCARD_bus.mosi) {
-        ST25R_LOG("_initSPI: sharing SDCARD SPI");
-        _spi = &sdcardSPI;
-    } else {
-        ST25R_LOG("_initSPI: creating dedicated HSPI");
-        static SPIClass st25rSPI(HSPI);
-        static bool spiStarted = false;
-        if (!spiStarted) {
-            st25rSPI.begin(
-                (int)bruceConfigPins.ST25R_bus.sck,
-                (int)bruceConfigPins.ST25R_bus.miso,
-                (int)bruceConfigPins.ST25R_bus.mosi
-            );
-            spiStarted = true;
-        }
-        _spi = &st25rSPI;
+    _spi = acquireSPIBus(
+        bruceConfigPins.ST25R_bus.sck, bruceConfigPins.ST25R_bus.miso, bruceConfigPins.ST25R_bus.mosi
+    );
+    if (!_spi) {
+        ST25R_LOG("_initSPI: no hardware SPI bus available for these pins");
+        return false;
     }
 
     _hw = new RfalRfST25R3916Class(_spi, cs, irq);
@@ -253,8 +248,8 @@ bool ST25R3916::_initSPI() {
 }
 
 bool ST25R3916::_initI2C() {
-    Wire.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
-    _hw = new RfalRfST25R3916Class(&Wire, GPIO_NUM_NC);
+    TwoWire *Wire = acquireI2CBus();
+    _hw = new RfalRfST25R3916Class(Wire, GPIO_NUM_NC);
     return _hw != nullptr;
 }
 
@@ -405,10 +400,12 @@ int ST25R3916::_readDataBlocks(rfalNfcDevice *dev) {
         return FAILURE;
     }
 
-    // Detect NTAG size from CC page (page 3)
+    // Detect NTAG size from CC page (page 3). Uses _t2tReadPage() (a longer,
+    // configurable timeout) instead of rfalT2TPollerRead() directly - see
+    // kT2tPostActivationTimeoutMs comment above _getNtagVariant().
     uint8_t ccBuf[16] = {0};
     uint16_t rcvLen = 0;
-    auto ccErr = _nfc->rfalT2TPollerRead(3, ccBuf, sizeof(ccBuf), &rcvLen);
+    auto ccErr = _t2tReadPage(3, ccBuf, sizeof(ccBuf), &rcvLen);
     if (ccErr != ST_ERR_NONE || rcvLen < 4) {
         pageReadStatus = FAILURE;
         return FAILURE;
@@ -428,7 +425,7 @@ int ST25R3916::_readDataBlocks(rfalNfcDevice *dev) {
     for (int page = 0; page < totalPages; page++) {
         uint8_t pageData[16] = {0};
         uint16_t len = 0;
-        auto err = _nfc->rfalT2TPollerRead(page, pageData, sizeof(pageData), &len);
+        auto err = _t2tReadPage(page, pageData, sizeof(pageData), &len);
         if (err != ST_ERR_NONE || len < 4) {
             pageReadStatus = FAILURE;
             return FAILURE;
@@ -679,22 +676,30 @@ int ST25R3916::_writeNdefBlocks(rfalNfcDevice *dev) {
     uint8_t ndefPayload[180] = {0};
     size_t idx = 0;
 
-    if (ndefMessage.messageSize == 0 || ndefMessage.payloadSize == 0) return FAILURE;
-    if ((size_t)ndefMessage.messageSize + 3 > sizeof(ndefPayload)) return FAILURE;
+    if (!rawNdefRecord.empty()) {
+        if (rawNdefRecord.size() + 3 > sizeof(ndefPayload) || rawNdefRecord.size() > 254) return FAILURE;
+        ndefPayload[idx++] = 0x03;
+        ndefPayload[idx++] = static_cast<uint8_t>(rawNdefRecord.size());
+        for (uint8_t b : rawNdefRecord) ndefPayload[idx++] = b;
+        ndefPayload[idx++] = 0xFE;
+    } else {
+        if (ndefMessage.messageSize == 0 || ndefMessage.payloadSize == 0) return FAILURE;
+        if ((size_t)ndefMessage.messageSize + 3 > sizeof(ndefPayload)) return FAILURE;
 
-    ndefPayload[idx++] = ndefMessage.begin;
-    ndefPayload[idx++] = ndefMessage.messageSize;
-    ndefPayload[idx++] = ndefMessage.header;
-    ndefPayload[idx++] = ndefMessage.tnf;
-    ndefPayload[idx++] = ndefMessage.payloadSize;
-    ndefPayload[idx++] = ndefMessage.payloadType;
+        ndefPayload[idx++] = ndefMessage.begin;
+        ndefPayload[idx++] = ndefMessage.messageSize;
+        ndefPayload[idx++] = ndefMessage.header;
+        ndefPayload[idx++] = ndefMessage.tnf;
+        ndefPayload[idx++] = ndefMessage.payloadSize;
+        ndefPayload[idx++] = ndefMessage.payloadType;
 
-    for (uint8_t i = 0; i < ndefMessage.payloadSize && idx < sizeof(ndefPayload); i++) {
-        ndefPayload[idx++] = ndefMessage.payload[i];
+        for (uint8_t i = 0; i < ndefMessage.payloadSize && idx < sizeof(ndefPayload); i++) {
+            ndefPayload[idx++] = ndefMessage.payload[i];
+        }
+
+        if (idx >= sizeof(ndefPayload)) return FAILURE;
+        ndefPayload[idx++] = ndefMessage.end;
     }
-
-    if (idx >= sizeof(ndefPayload)) return FAILURE;
-    ndefPayload[idx++] = ndefMessage.end;
 
     int maxBytes = (totalPages > 0 ? (totalPages - 5 - 4) : 36) * 4;
     if (maxBytes <= 0 || (int)idx > maxBytes) {
@@ -1459,6 +1464,29 @@ int ST25R3916::loadFromFile(const String &filepath) {
     return SUCCESS;
 }
 
+// RFAL's rfalT2TPollerRead()/GET_VERSION/READ_SIG default timeouts (5-20ms,
+// see rfal_t2t.cpp's RFAL_FDT_POLL_READ_MAX) assume near-instant silicon tag
+// response. A software tag emulator relaying through an MCU (e.g. Bruce's own
+// PN532 emulate(), I2C-bound and deliberately clocked slow for target-mode
+// stability) can easily take longer than that to answer post-activation
+// commands, causing spurious ST_ERR_TIMEOUT even though the emulator would
+// have answered given a bit more time. Used for all raw post-activation T2T
+// reads issued directly via rfalTransceiveBlockingTxRx() in this file.
+static constexpr uint32_t kT2tPostActivationTimeoutMs = 60;
+
+::ReturnCode ST25R3916::_t2tReadPage(uint8_t page, uint8_t *rxBuf, uint16_t rxBufLen, uint16_t *rcvLen) {
+    uint8_t cmd[2] = {0x30, page}; // NFC Forum Type 2 Tag READ command (T2T 1.0 5.2, table 11)
+    return _hw->rfalTransceiveBlockingTxRx(
+        cmd,
+        sizeof(cmd),
+        rxBuf,
+        rxBufLen,
+        rcvLen,
+        RFAL_TXRX_FLAGS_DEFAULT,
+        rfalConvMsTo1fc(kT2tPostActivationTimeoutMs)
+    );
+}
+
 String ST25R3916::_getNtagVariant() {
     ntagHasVersion = false;
     memset(ntagVersion, 0, sizeof(ntagVersion));
@@ -1467,7 +1495,7 @@ String ST25R3916::_getNtagVariant() {
     uint8_t rx[10] = {0};
     uint16_t rxLen = 0;
     auto err = _hw->rfalTransceiveBlockingTxRx(
-        &cmd, 1, rx, sizeof(rx), &rxLen, RFAL_TXRX_FLAGS_DEFAULT, rfalConvMsTo1fc(20)
+        &cmd, 1, rx, sizeof(rx), &rxLen, RFAL_TXRX_FLAGS_DEFAULT, rfalConvMsTo1fc(kT2tPostActivationTimeoutMs)
     );
     if (err != ST_ERR_NONE || rxLen < 8) {
         ST25R_LOG("_getNtagVariant: GET_VERSION failed err=%d len=%u", (int)err, rxLen);
@@ -1515,7 +1543,13 @@ bool ST25R3916::_readNtagSignature() {
     uint8_t rx[40] = {0};
     uint16_t rxLen = 0;
     auto err = _hw->rfalTransceiveBlockingTxRx(
-        cmd, sizeof(cmd), rx, sizeof(rx), &rxLen, RFAL_TXRX_FLAGS_DEFAULT, rfalConvMsTo1fc(20)
+        cmd,
+        sizeof(cmd),
+        rx,
+        sizeof(rx),
+        &rxLen,
+        RFAL_TXRX_FLAGS_DEFAULT,
+        rfalConvMsTo1fc(kT2tPostActivationTimeoutMs)
     );
     if (err != ST_ERR_NONE || rxLen < 32) {
         ST25R_LOG("_readNtagSignature: READ_SIG failed err=%d len=%u", (int)err, rxLen);
@@ -1538,7 +1572,13 @@ bool ST25R3916::_readNtagCounters() {
         uint8_t rx[4] = {0};
         uint16_t rxLen = 0;
         auto err = _hw->rfalTransceiveBlockingTxRx(
-            cmd, sizeof(cmd), rx, sizeof(rx), &rxLen, RFAL_TXRX_FLAGS_DEFAULT, rfalConvMsTo1fc(20)
+            cmd,
+            sizeof(cmd),
+            rx,
+            sizeof(rx),
+            &rxLen,
+            RFAL_TXRX_FLAGS_DEFAULT,
+            rfalConvMsTo1fc(kT2tPostActivationTimeoutMs)
         );
         if (err == ST_ERR_NONE && rxLen >= 3) {
             ntagCounters[idx] = (uint32_t)rx[0] | ((uint32_t)rx[1] << 8) | ((uint32_t)rx[2] << 16);
@@ -1960,7 +2000,7 @@ static String _bytesToHex(const uint8_t *data, size_t len) {
 }
 
 // dump no formato .nfc do Flipper Zero.
-int ST25R3916::saveFlipper(String filename) {
+int ST25R3916::saveFlipper(const String &filename) {
     if (mfcLoaded || isMifareClassicSak(uid.sak)) return _saveMifareClassicFlipper(filename);
 
     FS *fs;
@@ -2006,7 +2046,7 @@ int ST25R3916::saveFlipper(String filename) {
     return SUCCESS;
 }
 
-int ST25R3916::save(String filename) {
+int ST25R3916::save(const String &filename) {
     FS *fs;
     if (!getFsStorage(fs)) return FAILURE;
 
@@ -2423,6 +2463,7 @@ void ST25R3916::_mfcRebuildStrAllPages() {
 }
 
 int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
+    bruceConfig.ensureMifareKeysLoaded();
     memset(&mfcDump, 0, sizeof(mfcDump));
     _mfcAuthed = false;
 
@@ -2451,15 +2492,15 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
 
         bool authed = false;
         bool usedKeyB = false;
-        int usedKeyIdx = -1;
+        uint8_t usedKeyBytes[6] = {0};
 
-        // Try Key A then Key B from the dictionary against the sector trailer.
+        // Try Key A then Key B from the builtin dictionary.
         for (int useB = 0; useB <= 1 && !authed; useB++) {
             for (int kidx = 0; kidx < nKeys; kidx++) {
                 if (_mifareAuth(trailer, keys[kidx], useB != 0)) {
                     authed = true;
                     usedKeyB = (useB != 0);
-                    usedKeyIdx = kidx;
+                    memcpy(usedKeyBytes, keys[kidx], 6);
                     break;
                 }
                 // A failed auth leaves the field/cipher dirty: halt + reselect.
@@ -2476,16 +2517,43 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
             }
         }
 
+        // Fallback: try user keys from bruceConfig.mifareKeys (custom dictionary).
+        if (!authed) {
+            for (int useB = 0; useB <= 1 && !authed; useB++) {
+                for (const auto &mifKey : bruceConfig.mifareKeys) {
+                    uint8_t k[6];
+                    for (int i = 0; i < 6; i++)
+                        k[i] = (uint8_t)strtoul(mifKey.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+                    if (_mifareAuth(trailer, k, useB != 0)) {
+                        authed = true;
+                        usedKeyB = (useB != 0);
+                        memcpy(usedKeyBytes, k, 6);
+                        break;
+                    }
+                    _mfcHalt();
+                    _nfc->rfalNfcDeactivate(false);
+                    delay(5);
+                    rfalNfcDevice *d2 = nullptr;
+                    if (!_pollForTag(&d2, 500)) {
+                        pageReadStatus = FAILURE;
+                        return FAILURE;
+                    }
+                    _parseDevice(d2);
+                    _mfcAuthed = false;
+                }
+            }
+        }
+
         if (!authed) {
             ST25R_LOG("mfc sector %u: no key found", s);
             continue;
         }
 
         if (usedKeyB) {
-            memcpy(mfcDump.keyB[s], keys[usedKeyIdx], 6);
+            memcpy(mfcDump.keyB[s], usedKeyBytes, 6);
             mfcDump.keyBFound[s] = true;
         } else {
-            memcpy(mfcDump.keyA[s], keys[usedKeyIdx], 6);
+            memcpy(mfcDump.keyA[s], usedKeyBytes, 6);
             mfcDump.keyAFound[s] = true;
         }
 
@@ -2990,8 +3058,15 @@ void ST25R3916::_buildT4TFiles() {
 
     uint8_t rec[400];
     uint16_t rl = 0;
-    if (ndefMessage.payloadSize > 0 &&
-        (ndefMessage.payloadType == NDEF_URI || ndefMessage.payloadType == NDEF_TEXT)) {
+    if (!rawNdefRecord.empty() && rawNdefRecord.size() <= sizeof(rec)) {
+        // Record shapes ndefMessage can't hold (MIME/WSC Wi-Fi records, etc.)
+        // are already a complete record - header through payload.
+        memcpy(rec, rawNdefRecord.data(), rawNdefRecord.size());
+        rl = (uint16_t)rawNdefRecord.size();
+    } else if (
+        ndefMessage.payloadSize > 0 &&
+        (ndefMessage.payloadType == NDEF_URI || ndefMessage.payloadType == NDEF_TEXT)
+    ) {
         // Single short NDEF record from the ndefMessage struct (set via 'rfid ndef').
         rec[0] = 0xD1; // MB|ME|SR, TNF=well-known
         rec[1] = 0x01; // type length

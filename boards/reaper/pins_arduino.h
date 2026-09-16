@@ -18,6 +18,8 @@ static const uint8_t RX = SERIAL_RX;
 // Main I2C Bus
 #define GROVE_SDA 47
 #define GROVE_SCL 48
+#define SYS_I2C_SDA 47
+#define SYS_I2C_SCL 48
 
 static const uint8_t SDA = 47;
 static const uint8_t SCL = 48;
@@ -60,11 +62,11 @@ static const uint8_t SCK = SPI_SCK_PIN;
 
 // NRF24
 #define USE_NRF24_VIA_SPI
-#define NRF24_CE_PIN -1
-#define NRF24_SS_PIN -1
-#define NRF24_MOSI_PIN -1
-#define NRF24_SCK_PIN -1
-#define NRF24_MISO_PIN -1
+#define NRF24_CE_PIN 14
+#define NRF24_SS_PIN 13
+#define NRF24_MOSI_PIN SPI_MOSI_PIN
+#define NRF24_SCK_PIN SPI_SCK_PIN
+#define NRF24_MISO_PIN SPI_MISO_PIN
 
 // FONT SIZE
 #define FP 1
@@ -101,15 +103,17 @@ static const uint8_t SCK = SPI_SCK_PIN;
 #define SDCARD_MOSI SPI_MOSI_PIN
 
 // RGB LED
-
 #define HAS_RGB_LED 1
 #define RGB_LED 45
 #define LED_TYPE WS2812B
-#define LED_ORDER RGB
+#define LED_ORDER GRB
 #define LED_TYPE_IS_RGBW 0
 #define LED_COUNT 16
-
 #define LED_COLOR_STEP 5
+
+// GPS Bus
+#define GPS_SERIAL_RX 44
+#define GPS_SERIAL_TX 43
 
 // PMIC
 // #define XPOWERS_CHIP_BQ25896

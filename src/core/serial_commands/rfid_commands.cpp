@@ -2,11 +2,19 @@
 #if !defined(LITE_VERSION)
 #include "modules/rfid/ST25R3916.h"
 #endif
+#include "core/sd_functions.h"
 #include "modules/rfid/PN532.h"
 #include "modules/rfid/RFID2.h"
 #include "modules/rfid/RFIDInterface.h"
-#include "core/sd_functions.h"
 #include <globals.h>
+
+// Common workflows via serial:
+//   Read a tag:                    rfid read [timeout=5000]
+//   Emulate NDEF over ISO14443-4:  rfid emulate t4t [url|text <value>]
+//   Emulate over FeliCa:           rfid emulate felica
+//   Emulate from a saved file:     rfid loadfile [filepath] -> rfid emulate [t4t|felica]
+//   Write NDEF to a tag:           rfid ndef [url|text] [value]
+//   Write to a tag from a file:    rfid loadfile [filepath] -> rfid write [timeout=5000]
 
 static RFIDInterface *_rfid = nullptr;
 
@@ -163,7 +171,19 @@ uint32_t rfidEmulateCallback(cmd *c) {
         }
     }
 
-    serialDevice->println("Starting RFID emulation" + (mode.length() ? (" (" + mode + ")") : String("")) + "...");
+    if (_rfid->printableUID.uid.length() > 0) {
+        serialDevice->println(
+            "Emulating UID: " + _rfid->printableUID.uid + " (" + _rfid->printableUID.picc_type + ")"
+        );
+    }
+    String caveat = _rfid->emulationCaveat();
+    if (caveat.length() > 0) serialDevice->println("[!] " + caveat);
+    serialDevice->println(
+        "Starting RFID emulation" + (mode.length() ? (" (" + mode + ")") : String("")) + "..."
+    );
+    // backToMenu() (run after every serial command) leaves this flag set, which
+    // would make emulate()'s loop bail out on its very first iteration.
+    returnToMenu = false;
     int result = _rfid->emulate();
     serialDevice->println("Emulate: " + _rfid->statusMessage(result));
     return result == RFIDInterface::SUCCESS;
@@ -331,6 +351,16 @@ uint32_t rfidAutotestCallback(cmd *c) {
     }
 
     if (mode == "emulate") {
+        if (_rfid->printableUID.uid.length() > 0) {
+            serialDevice->println(
+                "Emulating UID: " + _rfid->printableUID.uid + " (" + _rfid->printableUID.picc_type + ")"
+            );
+        }
+        String caveat = _rfid->emulationCaveat();
+        if (caveat.length() > 0) serialDevice->println("[!] " + caveat);
+        // backToMenu() (run after every serial command) leaves this flag set, which
+        // would make emulate()'s loop bail out on its very first iteration.
+        returnToMenu = false;
         int result = _rfid->emulate();
         serialDevice->println("Emulate: " + _rfid->statusMessage(result));
         return result == RFIDInterface::SUCCESS;

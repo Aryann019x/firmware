@@ -5,6 +5,7 @@
 // and contributors; the Flipper-name mapping mirrors the Flipper Zero firmware
 // (GPL-3.0-or-later). See THIRD_PARTY.md for full attribution.
 #include "rf_registry.h"
+#include "rf_registry_ext.h"
 
 // Canonical static OOK protocol table. Timings use the classic factor model
 // ({high,low} multiples of `te` µs). The numbered "RcSwitch_N" entries mirror
@@ -30,6 +31,7 @@ static const RfProtocolDef rf_protocols[] = {
     // name           te    sync       zero      one       bits inv  flags
     {"Princeton",     350, {1, 31},   {1, 3},   {3, 1},   24, false, SYNC},           // legacy proto 1
     {"NICE_FLO",      700, {1, 36},   {2, 1},   {1, 2},   12, false, SYNC | FIXED},   // legacy proto 22
+    {"Nice_12bit",    700, {36, 1},   {1, 2},   {2, 1},   12, true,  SYNC | FIXED},   // RF Bruteforce
     {"Linear",        500, {3, 42},   {1, 3},   {3, 1},   10, false, SYNC | FIXED},   // 10-bit DIP
     {"Clemsa",        385, {7, 50},   {1, 7},   {7, 1},   18, false, SYNC | FIXED},
     {"Mastercode",   1072, {2, 14},   {1, 2},   {2, 1},   36, false, SYNC | FIXED},
@@ -37,6 +39,7 @@ static const RfProtocolDef rf_protocols[] = {
     {"Ansonic",       555, {35, 1},   {1, 2},   {2, 1},   12, true,  SYNC | FIXED},
     {"GateTX",        350, {49, 2},   {1, 2},   {2, 1},   24, true,  SYNC | FIXED},
     {"Holtek",        430, {36, 1},   {1, 2},   {2, 1},   40, true,  SYNC | FIXED},   // HT6Pxx 40-bit
+    {"Holtek_12bit",  430, {36, 1},   {1, 2},   {2, 1},   12, true,  SYNC | FIXED},   // RF Bruteforce
     {"Holtek_HT12",   450, {23, 1},   {1, 2},   {2, 1},   12, true,  SYNC | FIXED},   // legacy proto 6 (HT6P20B)
     {"PhoenixV2",     427, {60, 6},   {1, 2},   {2, 1},   52, true,  SYNC | FIXED},
 
@@ -69,8 +72,12 @@ struct RfProtoAlias {
 };
 static const RfProtoAlias rf_proto_aliases[] = {
     {"Nice FLO", "NICE_FLO"},
+    {"Nice 12bit", "Nice_12bit"},
+    {"Holtek 12bit", "Holtek_12bit"},
+    {"Holtec 12bit", "Holtek_12bit"},
     {"Holtek_HT12X", "Holtek_HT12"},
     {"Phoenix_V2", "PhoenixV2"},
+    {"hormann", "Hormann_HSM"},
 };
 
 const RfProtocolDef *rf_find_protocol(const String &name) {
@@ -85,7 +92,7 @@ const RfProtocolDef *rf_find_protocol(const String &name) {
     for (const auto &p : rf_protocols) {
         if (wanted == p.name) return &p;
     }
-    return nullptr;
+    return rf_find_ext_protocol(wanted);
 }
 
 String rf_flipper_protocol_name(const String &canonical) {

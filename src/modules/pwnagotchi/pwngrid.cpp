@@ -11,37 +11,66 @@ Thanks to @bmorcelli (Pirata) for his help doing a better code.
 #if !defined(LITE_VERSION)
 #include "pwngrid.h"
 #include "../wifi/sniffer.h"
+#include "core/wifi/webInterface.h"
 #include "core/wifi/wifi_common.h"
+#include <algorithm>
 
 uint8_t pwngrid_friends_tot = 0;
 std::vector<pwngrid_peer> pwngrid_peers;
 String pwngrid_last_friend_name = "";
 
+// The sniffer callback runs in the WiFi task and mutates pwngrid_peers while
+// the UI task copies/iterates it.  Without this lock a push_back during a UI
+// copy can corrupt the vector and reboot the device.
+static SemaphoreHandle_t pwngridMutex = nullptr;
+
+static bool lockPwngrid() {
+    if (pwngridMutex == nullptr) return true;
+    return xSemaphoreTake(pwngridMutex, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+static void unlockPwngrid() {
+    if (pwngridMutex != nullptr) xSemaphoreGive(pwngridMutex);
+}
+
 uint8_t getPwngridTotalPeers() { return pwngrid_friends_tot; }
 uint8_t getPwngridRunTotalPeers() { return pwngrid_friends_tot; }
-String getPwngridLastFriendName() { return pwngrid_last_friend_name; }
-std::vector<pwngrid_peer> getPwngridPeers() { return pwngrid_peers; }
+
+String getPwngridLastFriendName() {
+    if (!lockPwngrid()) return "";
+    String name = pwngrid_last_friend_name;
+    unlockPwngrid();
+    return name;
+}
+
+std::vector<pwngrid_peer> getPwngridPeers() {
+    if (!lockPwngrid()) return {};
+    std::vector<pwngrid_peer> peers = pwngrid_peers;
+    unlockPwngrid();
+    return peers;
+}
 
 // Add pwngrid peers
 void add_new_peer(JsonDocument &json, signed int rssi) {
+    if (!lockPwngrid()) return;
+
+    String identity = json["identity"].as<String>();
     // Check if it exists in the list
-    bool exists = false;
-    for (auto peer_list : pwngrid_peers) {
-        if (peer_list.identity == json["identity"].as<String>()) {
-            exists = true;
+    for (auto &peer_list : pwngrid_peers) {
+        if (peer_list.identity == identity) {
             peer_list.last_ping = millis();
             peer_list.gone = false;
             peer_list.rssi = rssi;
+            unlockPwngrid();
             return;
         }
     }
     // Check if doesn't exists AND there are room in RAM memory to save
-    if (!exists && pwngrid_peers.size() < 50) {
+    if (pwngrid_peers.size() < 50) {
         pwngrid_peers.push_back((pwngrid_peer){
             json["epoch"].as<int>(),
             json["face"].as<String>(),
             json["grid_version"].as<String>(),
-            json["identity"].as<String>(),
+            identity,
             json["name"].as<String>(),
             json["pwnd_run"].as<int>(),
             json["pwnd_tot"].as<int>(),
@@ -57,26 +86,7 @@ void add_new_peer(JsonDocument &json, signed int rssi) {
         pwngrid_last_friend_name = json["name"].as<String>();
         pwngrid_friends_tot = pwngrid_peers.size();
     }
-}
-
-// Delete pwngrid peers
-void delete_peer_gone() { // Delete peers wigh pwngrid_peers.gone = true
-    std::vector<int>
-        peer_gone; // Create a vector of integers to save the index value of the element to be deleted
-    int index = 0;
-    for (const auto &peer_list : pwngrid_peers) {
-        if (peer_list.gone) peer_gone.push_back(index); // Saves the index value into the vector
-        index++;
-    }
-    std::reverse(
-        peer_gone.begin(), peer_gone.end()
-    ); // Reverse the vector to iterate from the end to the beginning
-    for (auto ind : peer_gone) {
-        pwngrid_peers.erase(pwngrid_peers.begin() + ind); // Delete the peer from the list
-        // Update counter;
-        pwngrid_friends_tot = pwngrid_peers.size();
-    }
-    peer_gone.clear();
+    unlockPwngrid();
 }
 
 // Had to remove Radiotap headers, since its automatically added
@@ -179,25 +189,42 @@ esp_err_t pwngridAdvertise(uint8_t channel, String face) {
 const int away_threshold = 120000;
 
 void checkPwngridGoneFriends() {
-    for (auto peer_list : pwngrid_peers) {
-        // Check if peer is away
-        int away_secs = peer_list.last_ping - millis();
-        if (away_secs > away_threshold) {
+    if (!lockPwngrid()) return;
+
+    bool removed = false;
+    for (auto &peer_list : pwngrid_peers) {
+        // millis() wraps, so use unsigned subtraction; the old expression
+        // compared the wrong way around and never expired peers.
+        if (millis() - peer_list.last_ping > (unsigned long)away_threshold) {
             peer_list.gone = true;
-            delete_peer_gone();
-            return;
         }
+        if (peer_list.gone) removed = true;
     }
+
+    if (removed) {
+        pwngrid_peers.erase(
+            std::remove_if(
+                pwngrid_peers.begin(),
+                pwngrid_peers.end(),
+                [](const pwngrid_peer &peer) { return peer.gone; }
+            ),
+            pwngrid_peers.end()
+        );
+        pwngrid_friends_tot = pwngrid_peers.size();
+    }
+    unlockPwngrid();
 }
 
 signed int getPwngridClosestRssi() {
     signed int closest = -1000;
+    if (!lockPwngrid()) return closest;
 
-    for (auto peer_list : pwngrid_peers) {
+    for (const auto &peer_list : pwngrid_peers) {
         // Check if peer is away
         if (peer_list.gone == false && peer_list.rssi > closest) { closest = peer_list.rssi; }
     }
 
+    unlockPwngrid();
     return closest;
 }
 
@@ -256,9 +283,8 @@ void pwnSnifferCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
         BeaconList Beacon;
         memcpy(Beacon.MAC, apAddr, 6);
         Beacon.channel = ch;
-        if (registeredBeacons.find(Beacon) == registeredBeacons.end()) {
-            registeredBeacons.insert(Beacon); // Save a new MAC to Deauth
-        }
+        // Save a new MAC to Deauth (helper takes the beacon lock).
+        sniffer_add_beacon(Beacon);
     }
 
     String src = "";
@@ -312,17 +338,34 @@ const wifi_promiscuous_filter_t filter = {
 };
 
 void initPwngrid() {
+    // Reconfiguring/stopping WiFi while the WebUI is serving requests can
+    // trigger AsyncTCP use-after-free reboots.
+    cleanlyStopWebUiForWiFiFeature();
     ensureWifiPlatform();
+    if (pwngridMutex == nullptr) { pwngridMutex = xSemaphoreCreateMutex(); }
     wifi_init_config_t WIFI_INIT_CONFIG = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&WIFI_INIT_CONFIG);
+    esp_err_t err = esp_wifi_init(&WIFI_INIT_CONFIG);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.printf("[Pwngrid] WiFi init failed: %s\n", esp_err_to_name(err));
+        return;
+    }
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_start();
+    // The Arduino stack may have left the radio running in STA/APSTA mode.
+    // Restart it in AP mode so the sniffer has a valid interface.
+    esp_wifi_stop();
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err != ESP_OK) { Serial.printf("[Pwngrid] set_mode failed: %s\n", esp_err_to_name(err)); }
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_STATE) {
+        Serial.printf("[Pwngrid] start failed: %s\n", esp_err_to_name(err));
+        return;
+    }
     esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(pwnSnifferCallback);
     // esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_channel(random(0, 14), WIFI_SECOND_CHAN_NONE);
+    // Channels are 1..14; the old random(0, 14) could return 0, which is invalid.
+    esp_wifi_set_channel(random(1, 15), WIFI_SECOND_CHAN_NONE);
     vTaskDelay(1 / portTICK_RATE_MS);
 }
 #endif

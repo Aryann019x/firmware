@@ -80,8 +80,8 @@ TaskHandle_t snifferWriterHandle = nullptr;
 StaticSemaphore_t fileMutexBuffer;
 SemaphoreHandle_t handshakeMutex = nullptr;
 StaticSemaphore_t handshakeMutexBuffer;
-std::set<BeaconList> registeredBeacons;
-std::set<String> SavedHS; // Saves the MAC of beacon HS detected in the session
+static std::set<BeaconList> registeredBeacons;
+static std::set<String> SavedHS; // Saves the MAC of beacon HS detected in the session
 String filename = "/BrucePCAP/" + (String)FILENAME + ".pcap";
 String deauthFilename = "/BrucePCAP/deauth_0.pcap";
 int deauthFileIndex = 0;
@@ -97,6 +97,65 @@ std::set<uint64_t> handshakeBeaconLogged;
 std::map<uint64_t, uint32_t> beaconLastSeen; // key = macToKey(mac) -> last seen millis()
 const uint32_t BEACON_TIMEOUT_MS = 120000;   // 2 minutes
 unsigned long lastBeaconCleanup = 0;
+
+// Serializes registeredBeacons + beaconSsidCache + beaconLastSeen between the
+// sniffer callback and the UI task.
+static SemaphoreHandle_t beaconMutex = nullptr;
+static StaticSemaphore_t beaconMutexBuffer;
+static portMUX_TYPE beaconMutexInitMux = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t ensureBeaconMutex() {
+    if (beaconMutex != nullptr) return beaconMutex;
+    portENTER_CRITICAL(&beaconMutexInitMux);
+    if (beaconMutex == nullptr) { beaconMutex = xSemaphoreCreateMutexStatic(&beaconMutexBuffer); }
+    portEXIT_CRITICAL(&beaconMutexInitMux);
+    return beaconMutex;
+}
+
+bool sniffer_lock_beacons(TickType_t timeout) {
+    SemaphoreHandle_t mutex = ensureBeaconMutex();
+    return mutex != nullptr && xSemaphoreTake(mutex, timeout) == pdTRUE;
+}
+
+void sniffer_unlock_beacons() {
+    if (beaconMutex != nullptr) xSemaphoreGive(beaconMutex);
+}
+
+void sniffer_add_beacon(const BeaconList &beacon) {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(50))) return;
+    registeredBeacons.insert(beacon);
+    sniffer_unlock_beacons();
+}
+
+bool sniffer_beacon_exists(const BeaconList &beacon) {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(50))) return false;
+    bool exists = registeredBeacons.find(beacon) != registeredBeacons.end();
+    sniffer_unlock_beacons();
+    return exists;
+}
+
+size_t sniffer_beacon_count() {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(50))) return 0;
+    size_t count = registeredBeacons.size();
+    sniffer_unlock_beacons();
+    return count;
+}
+
+void sniffer_clear_beacons() {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(100))) return;
+    registeredBeacons.clear();
+    beaconSsidCache.clear();
+    beaconLastSeen.clear();
+    sniffer_unlock_beacons();
+}
+
+std::vector<BeaconList> sniffer_copy_beacons() {
+    std::vector<BeaconList> copy;
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(100))) return copy;
+    copy.assign(registeredBeacons.begin(), registeredBeacons.end());
+    sniffer_unlock_beacons();
+    return copy;
+}
 
 struct SnifferQueueItem {
     wifi_promiscuous_pkt_t *packet = nullptr;
@@ -440,7 +499,7 @@ static void registerBeacon(const uint8_t *apAddr) {
     BeaconList beacon;
     memcpy(beacon.MAC, apAddr, sizeof(beacon.MAC));
     beacon.channel = ch;
-    registeredBeacons.insert(beacon);
+    sniffer_add_beacon(beacon);
 }
 
 static String resolveSsidForFrame(FrameInfo &info, const wifi_promiscuous_pkt_t *packet) {
@@ -448,12 +507,17 @@ static String resolveSsidForFrame(FrameInfo &info, const wifi_promiscuous_pkt_t 
     if (info.isBeacon) {
         beacon_frames++;
         String ssid = extractSsid(packet);
-        beaconSsidCache[info.apKey] = ssid;
+        if (sniffer_lock_beacons(pdMS_TO_TICKS(20))) {
+            beaconSsidCache[info.apKey] = ssid;
+            sniffer_unlock_beacons();
+        }
         return ssid;
     }
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(20))) return "";
     auto it = beaconSsidCache.find(info.apKey);
-    if (it != beaconSsidCache.end()) { return it->second; }
-    return "";
+    String ssid = (it != beaconSsidCache.end()) ? it->second : "";
+    sniffer_unlock_beacons();
+    return ssid;
 }
 
 static FrameInfo analyzeFrame(wifi_promiscuous_pkt_t *pkt) {
@@ -495,7 +559,10 @@ static FrameInfo analyzeFrame(wifi_promiscuous_pkt_t *pkt) {
     if (info.isBeacon) {
         registerBeacon(info.apAddr);
         // UPDATE last-seen timestamp for this beacon
-        beaconLastSeen[info.apKey] = (uint32_t)millis();
+        if (sniffer_lock_beacons(pdMS_TO_TICKS(20))) {
+            beaconLastSeen[info.apKey] = (uint32_t)millis();
+            sniffer_unlock_beacons();
+        }
     }
 
     return info;
@@ -723,6 +790,8 @@ void sniffer_wait_for_flush(uint32_t timeoutMs) {
     }
 }
 
+void sniffer_mark_handshake_saved(const String &path) { registerHandshakeRecord(path); }
+
 void sniffer_reset_handshake_cache() {
     if (handshakeMutex && xSemaphoreTake(handshakeMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         SavedHS.clear();
@@ -881,6 +950,7 @@ void openFile(FS &Fs) {
 // --- New helper implementations ---
 
 static void cleanupStaleBeacons() {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(100))) return;
     unsigned long now = millis();
     std::vector<BeaconList> toRemove;
     for (auto it = registeredBeacons.begin(); it != registeredBeacons.end(); ++it) {
@@ -903,9 +973,11 @@ static void cleanupStaleBeacons() {
         beaconSsidCache.erase(key);
         beaconLastSeen.erase(key);
     }
+    sniffer_unlock_beacons();
 }
 
 static size_t countActiveBeaconsOnChannel(uint8_t channel) {
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(100))) return 0;
     unsigned long now = millis();
     size_t cnt = 0;
     for (const auto &b : registeredBeacons) {
@@ -914,11 +986,13 @@ static size_t countActiveBeaconsOnChannel(uint8_t channel) {
         auto it = beaconLastSeen.find(key);
         if (it != beaconLastSeen.end() && (now - (unsigned long)it->second) <= BEACON_TIMEOUT_MS) { ++cnt; }
     }
+    sniffer_unlock_beacons();
     return cnt;
 }
 
 static std::vector<String> recentSsidsOnChannel(uint8_t channel, size_t maxItems) {
     std::vector<String> out;
+    if (!sniffer_lock_beacons(pdMS_TO_TICKS(100))) return out;
     unsigned long now = millis();
     for (const auto &b : registeredBeacons) {
         if (b.channel != channel) continue;
@@ -941,6 +1015,7 @@ static std::vector<String> recentSsidsOnChannel(uint8_t channel, size_t maxItems
             if (out.size() >= maxItems) break;
         }
     }
+    sniffer_unlock_beacons();
     return out;
 }
 
@@ -984,20 +1059,32 @@ void sniffer_setup() {
     tft.setCursor(80, 100);
 
     sniffer_reset_handshake_cache(); // Need to clear to restart HS count
-    registeredBeacons.clear();
-    beaconSsidCache.clear();
-    beaconLastSeen.clear(); // ensure starts empty
+    sniffer_clear_beacons();         // also clears the SSID / last-seen caches
 
     /* setup wifi */
     ensureWifiPlatform();
-    nvs_flash_init();
+    esp_err_t wifiErr = nvs_flash_init();
+    if (wifiErr == ESP_ERR_NVS_NO_FREE_PAGES || wifiErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        wifiErr = nvs_flash_init();
+    }
+    if (wifiErr != ESP_OK) { Serial.printf("[Sniffer] NVS init failed: %s\n", esp_err_to_name(wifiErr)); }
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    // The Arduino WiFi stack may already own the driver.  Treat that as success:
+    // the old ESP_ERROR_CHECK() aborted the device here (boot loop).
+    wifiErr = esp_wifi_init(&cfg);
+    if (wifiErr != ESP_OK && wifiErr != ESP_ERR_INVALID_STATE) {
+        displayError("WiFi init failed", true);
+        return;
+    }
+    // Storage type is fixed once the driver is initialized; not fatal.
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
     wifi_config_t wifi_config;
-    strcpy((char *)wifi_config.ap.ssid, "BruceSniffer");
-    strcpy((char *)wifi_config.ap.password, "brucenet");
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    strncpy((char *)wifi_config.ap.ssid, "BruceSniffer", sizeof(wifi_config.ap.ssid) - 1);
+    strncpy((char *)wifi_config.ap.password, "brucenet", sizeof(wifi_config.ap.password) - 1);
     wifi_config.ap.ssid_len = strlen("BruceSniffer");
     wifi_config.ap.channel = 1;                   // Channel
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK; // auth mode
@@ -1005,10 +1092,18 @@ void sniffer_setup() {
     wifi_config.ap.max_connection = 2;            // Max connections
     wifi_config.ap.beacon_interval = 100;         // beacon interval in ms
 
-    // Configura o modo AP
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    // Configura o modo AP.  Stop a driver left running by the Arduino stack
+    // first; otherwise set_mode/start can fail and abort the device.
+    esp_wifi_stop();
+    wifiErr = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (wifiErr != ESP_OK) { Serial.printf("[Sniffer] set_mode failed: %s\n", esp_err_to_name(wifiErr)); }
+    wifiErr = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (wifiErr != ESP_OK) { Serial.printf("[Sniffer] set_config failed: %s\n", esp_err_to_name(wifiErr)); }
+    wifiErr = esp_wifi_start();
+    if (wifiErr != ESP_OK && wifiErr != ESP_ERR_WIFI_STATE) {
+        displayError("WiFi start failed", true);
+        return;
+    }
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(sniffer);
     wifi_second_chan_t secondCh = (wifi_second_chan_t)NULL;
@@ -1149,8 +1244,7 @@ void sniffer_setup() {
                      num_HS = 0;
                      start_time = millis();
                      beacon_frames = 0;
-                     registeredBeacons.clear();
-                     beaconSsidCache.clear();
+                     sniffer_clear_beacons();
                      sniffer_reset_handshake_cache();
                      deauth_tmp = millis();
                  }                                                                                        },
@@ -1202,7 +1296,7 @@ void sniffer_setup() {
             // New: show beacon counts and recent SSIDs
             size_t activeOnChannel = countActiveBeaconsOnChannel(all_wifi_channels[ch]);
             padprintln(
-                "Beacons " + String(beacon_frames) + " tot. /" + String(registeredBeacons.size()) +
+                "Beacons " + String(beacon_frames) + " tot. /" + String(sniffer_beacon_count()) +
                 " cached / ch " + String(activeOnChannel) + " active"
             );
 
@@ -1250,10 +1344,13 @@ void sniffer_setup() {
 
         if (deauth && (millis() - deauth_tmp) > DEAUTH_INTERVAL) {
             bool deauth_sent = false;
-            if (registeredBeacons.size() > 40)
-                registeredBeacons.clear(); // Clear registered beacons to restart search and avoid restarts
+            if (sniffer_beacon_count() > 40)
+                sniffer_clear_beacons(); // Clear registered beacons to restart search and avoid restarts
             Serial.println("<<---- Starting Deauthentication Process ---->>");
-            for (auto registeredBeacon : registeredBeacons) {
+            // Work on a snapshot: the sniffer callback keeps inserting beacons
+            // while the deauth frames are transmitted.
+            std::vector<BeaconList> deauthBeacons = sniffer_copy_beacons();
+            for (const auto &registeredBeacon : deauthBeacons) {
                 if (registeredBeacon.channel == ch) {
                     memcpy(&ap_record.bssid, registeredBeacon.MAC, 6);
                     wsl_bypasser_send_raw_frame(

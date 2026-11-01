@@ -506,8 +506,19 @@ rmt_channel_handle_t setup_rf_rx() {
     rx_channel_cfg.flags.allow_pd = false;     // do not allow power domain to be powered off in sleep mode
     rx_channel_cfg.flags.io_loop_back = false; // do not loop back output to input
 
+    if ((int)rx_channel_cfg.gpio_num < 0) {
+        Serial.println("[RF] RX pin is not configured");
+        deinitRfModule();
+        return NULL;
+    }
+
     rmt_channel_handle_t rx_channel = NULL;
-    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_channel_cfg, &rx_channel));
+    esp_err_t err = rmt_new_rx_channel(&rx_channel_cfg, &rx_channel);
+    if (err != ESP_OK) {
+        Serial.printf("[RF] rmt_new_rx_channel failed: %s\n", esp_err_to_name(err));
+        deinitRfModule();
+        return NULL;
+    }
     return rx_channel;
 }
 

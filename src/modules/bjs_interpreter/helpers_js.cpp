@@ -29,7 +29,8 @@ void js_fatal_error_handler(JSContext *ctx) {
     obj = JS_GetException(ctx);
 
     JSValue jsvMessage = JS_GetPropertyStr(ctx, obj, "message");
-    if (strcmp(JS_ToCString(ctx, jsvMessage, &sb), "Script exited") == 0) { return; }
+    const char *messageCStr = JS_ToCString(ctx, jsvMessage, &sb);
+    if (messageCStr != NULL && strcmp(messageCStr, "Script exited") == 0) { return; }
 
     tft.fillScreen(bruceConfig.bgColor);
     tft.setTextSize(FM);
@@ -40,18 +41,20 @@ void js_fatal_error_handler(JSContext *ctx) {
     tft.setCursor(0, 33);
 
     JSValue jsvStack = JS_GetPropertyStr(ctx, obj, "stack");
-    const char *stackTrace = NULL;
+    String stackTrace;
     if (!JS_IsUndefined(jsvStack) && JS_IsString(ctx, jsvStack)) {
-        stackTrace = JS_ToCString(ctx, jsvStack, &sb);
+        const char *s = JS_ToCString(ctx, jsvStack, &sb);
+        if (s) stackTrace = s;
     } else {
         /* fallback to exception's string representation */
-        stackTrace = JS_ToCString(ctx, obj, &sb);
+        const char *s = JS_ToCString(ctx, obj, &sb);
+        if (s) stackTrace = s;
     }
 
     JS_PrintValueF(ctx, obj, JS_DUMP_LONG);
     const char *msg = JS_ToCString(ctx, obj, &sb);
 
-    print_errorMessage(msg != NULL ? msg : "JS Error", stackTrace);
+    print_errorMessage(msg != NULL ? msg : "JS Error", stackTrace.length() ? stackTrace.c_str() : NULL);
 }
 
 bool JS_IsTypedArray(JSContext *ctx, JSValue val) {

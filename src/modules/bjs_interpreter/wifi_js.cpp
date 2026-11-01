@@ -39,6 +39,7 @@ JSValue native_wifiConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue 
 
     JSCStringBuf ssb;
     const char *ssid = JS_ToCString(ctx, argv[0], &ssb);
+    if (ssid == nullptr) return JS_ThrowTypeError(ctx, "invalid SSID");
     int timeout_in_seconds = 10;
     if (argc > 1 && JS_IsNumber(ctx, argv[1])) JS_ToInt32(ctx, &timeout_in_seconds, argv[1]);
 
@@ -76,6 +77,7 @@ JSValue native_wifiConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue 
 JSValue native_wifiScan(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
     WiFi.mode(WIFI_MODE_STA);
     int nets = WiFi.scanNetworks();
+    if (nets < 0) nets = 0;
     JSValue arr = JS_NewArray(ctx, nets);
     uint32_t idx = 0;
     for (int i = 0; i < nets; i++) {
@@ -89,6 +91,7 @@ JSValue native_wifiScan(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         JS_SetPropertyStr(ctx, obj, "channel", JS_NewInt32(ctx, WiFi.channel(i)));
         JS_SetPropertyUint32(ctx, arr, idx++, obj);
     }
+    WiFi.scanDelete();
     return arr;
 }
 
@@ -122,8 +125,12 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
                 JSValue jsvKey = JS_GetPropertyUint32(ctx, argv[1], i);
                 JSValue jsvValue = JS_GetPropertyUint32(ctx, argv[1], i + 1);
                 if (JS_IsString(ctx, jsvKey) && JS_IsString(ctx, jsvValue)) {
-                    const char *key = JS_ToCString(ctx, jsvKey, &stringBuffer);
-                    const char *value = JS_ToCString(ctx, jsvValue, &stringBuffer);
+                    // Separate buffers: a shared JSCStringBuf would overwrite the
+                    // key while converting the value.
+                    JSCStringBuf keyBuffer;
+                    JSCStringBuf valueBuffer;
+                    const char *key = JS_ToCString(ctx, jsvKey, &keyBuffer);
+                    const char *value = JS_ToCString(ctx, jsvValue, &valueBuffer);
                     http.addHeader(key ? key : "", value ? value : "");
                 }
             }
@@ -131,16 +138,20 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     }
 
     // options object handling (body, method, responseType, headers)
-    const char *bodyRequest = NULL;
+    // Use String objects: JSCStringBuf is only a 5-byte scratch buffer for
+    // short strings, so keeping pointers from it across conversions corrupts
+    // the method/body values.
+    String bodyRequest;
     size_t bodyRequestLength = 0U;
-    const char *requestType = "GET";
+    String requestType = "GET";
     uint8_t returnResponseType = 0; // 0 = string, 1 = arraybuffer, 2 = json
 
     if (argc > 1 && JS_IsObject(ctx, argv[1])) {
         JSValue jsvBody = JS_GetPropertyStr(ctx, argv[1], "body");
         if (!JS_IsUndefined(jsvBody)) {
             if (JS_IsString(ctx, jsvBody) || JS_IsNumber(ctx, jsvBody) || JS_IsBool(jsvBody)) {
-                bodyRequest = JS_ToCString(ctx, jsvBody, &stringBuffer);
+                const char *bodyStr = JS_ToCString(ctx, jsvBody, &stringBuffer);
+                if (bodyStr) bodyRequest = bodyStr;
             } else if (JS_IsObject(ctx, jsvBody)) {
                 JSValue global = JS_GetGlobalObject(ctx);
                 JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
@@ -153,24 +164,27 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
                     if (!JS_IsException(jsvBodyRequest) &&
                         (JS_IsString(ctx, jsvBodyRequest) || JS_IsNumber(ctx, jsvBodyRequest) ||
                          JS_IsBool(jsvBodyRequest))) {
-                        bodyRequest = JS_ToCString(ctx, jsvBodyRequest, &stringBuffer);
+                        const char *bodyStr = JS_ToCString(ctx, jsvBodyRequest, &stringBuffer);
+                        if (bodyStr) bodyRequest = bodyStr;
                     }
                 }
             }
-            bodyRequestLength = bodyRequest == NULL ? 0U : strlen(bodyRequest);
+            bodyRequestLength = bodyRequest.length();
         }
 
         JSValue jsvMethod = JS_GetPropertyStr(ctx, argv[1], "method");
         if (!JS_IsUndefined(jsvMethod) && JS_IsString(ctx, jsvMethod)) {
-            requestType = JS_ToCString(ctx, jsvMethod, &stringBuffer);
+            const char *methodStr = JS_ToCString(ctx, jsvMethod, &stringBuffer);
+            if (methodStr) requestType = methodStr;
         }
 
         JSValue jsvResponseType = JS_GetPropertyStr(ctx, argv[1], "responseType");
         if (!JS_IsUndefined(jsvResponseType) && JS_IsString(ctx, jsvResponseType)) {
-            const char *responseType = JS_ToCString(ctx, jsvResponseType, &stringBuffer);
-            if (strcmp(responseType, "binary") == 0) {
+            JSCStringBuf responseBuf;
+            const char *responseType = JS_ToCString(ctx, jsvResponseType, &responseBuf);
+            if (responseType && strcmp(responseType, "binary") == 0) {
                 returnResponseType = 1;
-            } else if (strcmp(responseType, "json") == 0) {
+            } else if (responseType && strcmp(responseType, "json") == 0) {
                 returnResponseType = 2;
             }
         }
@@ -187,8 +201,10 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
                         JSValue jsvKey = JS_GetPropertyUint32(ctx, jsvHeaders, i);
                         JSValue jsvValue = JS_GetPropertyUint32(ctx, jsvHeaders, i + 1);
                         if (JS_IsString(ctx, jsvKey) && JS_IsString(ctx, jsvValue)) {
-                            const char *key = JS_ToCString(ctx, jsvKey, &stringBuffer);
-                            const char *value = JS_ToCString(ctx, jsvValue, &stringBuffer);
+                            JSCStringBuf keyBuf;
+                            JSCStringBuf valueBuf;
+                            const char *key = JS_ToCString(ctx, jsvKey, &keyBuf);
+                            const char *value = JS_ToCString(ctx, jsvValue, &valueBuf);
                             http.addHeader(key ? key : "", value ? value : "");
                         }
                     }
@@ -198,11 +214,13 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
                 for (uint32_t index = 0;; ++index) {
                     const char *key = JS_GetOwnPropertyByIndex(ctx, index, &prop_count, jsvHeaders);
                     if (key == NULL) break;
+                    String headerName = key;
                     JSValue hv = JS_GetPropertyStr(ctx, jsvHeaders, key);
                     if (!JS_IsUndefined(hv) &&
                         (JS_IsString(ctx, hv) || JS_IsNumber(ctx, hv) || JS_IsBool(hv))) {
-                        const char *val = JS_ToCString(ctx, hv, &stringBuffer);
-                        http.addHeader(key, val ? val : "");
+                        JSCStringBuf valBuf;
+                        const char *val = JS_ToCString(ctx, hv, &valBuf);
+                        http.addHeader(headerName, val ? val : "");
                     }
                 }
             }
@@ -214,7 +232,9 @@ JSValue native_httpFetch(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     // Send HTTP request
     // MEMO: Docs is wrong: sendRequest returns httpResponseCode not
     // Content-Length
-    int httpResponseCode = http.sendRequest(requestType, (uint8_t *)bodyRequest, bodyRequestLength);
+    int httpResponseCode = http.sendRequest(
+        requestType.c_str(), bodyRequestLength ? (uint8_t *)bodyRequest.c_str() : nullptr, bodyRequestLength
+    );
     if (httpResponseCode <= 0) {
         return JS_ThrowInternalError(ctx, http.errorToString(httpResponseCode).c_str());
     }

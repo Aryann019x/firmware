@@ -11,40 +11,54 @@ typedef struct {
 } TextViewerData;
 
 JSValue native_dialogMessage(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
-    const char *leftButton = NULL;
-    const char *centerButton = NULL;
-    const char *rightButton = NULL;
+    // Copy the labels into String objects.  JS_ToCString() may return a
+    // pointer into a short-lived JSCStringBuf, and the old code kept those
+    // pointers after the buffer went out of scope.
+    String leftButton;
+    String centerButton;
+    String rightButton;
     if (argc > 1 && JS_IsObject(ctx, argv[1])) {
         JSValue v = JS_GetPropertyStr(ctx, argv[1], "left");
-        if (!JS_IsUndefined(v)) {
+        if (JS_IsString(ctx, v)) {
             JSCStringBuf sb;
-            leftButton = JS_ToCString(ctx, v, &sb);
+            const char *s = JS_ToCString(ctx, v, &sb);
+            if (s) leftButton = s;
         }
         v = JS_GetPropertyStr(ctx, argv[1], "center");
-        if (!JS_IsUndefined(v)) {
+        if (JS_IsString(ctx, v)) {
             JSCStringBuf sb;
-            centerButton = JS_ToCString(ctx, v, &sb);
+            const char *s = JS_ToCString(ctx, v, &sb);
+            if (s) centerButton = s;
         }
         v = JS_GetPropertyStr(ctx, argv[1], "right");
-        if (!JS_IsUndefined(v)) {
+        if (JS_IsString(ctx, v)) {
             JSCStringBuf sb;
-            rightButton = JS_ToCString(ctx, v, &sb);
+            const char *s = JS_ToCString(ctx, v, &sb);
+            if (s) rightButton = s;
         }
     }
     if (argc < 1 || !JS_IsString(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "dialog.message(msg:string, buttons?:object)");
     JSCStringBuf msb;
     const char *msg = JS_ToCString(ctx, argv[0], &msb);
-    int8_t selectedButton = displayMessage(msg, leftButton, centerButton, rightButton, bruceConfig.priColor);
+    if (!msg) return JS_ThrowTypeError(ctx, "dialog.message: invalid message");
+
+    const char *left = leftButton.length() ? leftButton.c_str() : nullptr;
+    const char *center = centerButton.length() ? centerButton.c_str() : nullptr;
+    const char *right = rightButton.length() ? rightButton.c_str() : nullptr;
+    int8_t selectedButton = displayMessage(msg, left, center, right, bruceConfig.priColor);
+
     if (selectedButton == 0) {
-        return JS_NewString(
-            ctx, leftButton != NULL ? leftButton : (centerButton != NULL ? centerButton : "right")
-        );
+        if (left) return JS_NewString(ctx, left);
+        if (center) return JS_NewString(ctx, center);
+        if (right) return JS_NewString(ctx, right);
     } else if (selectedButton == 1) {
-        return JS_NewString(ctx, centerButton != NULL ? centerButton : "right");
-    } else {
-        return JS_NewString(ctx, "right");
+        if (center) return JS_NewString(ctx, center);
+        if (right) return JS_NewString(ctx, right);
+    } else if (right) {
+        return JS_NewString(ctx, right);
     }
+    return JS_NewString(ctx, "");
 }
 
 JSValue native_dialogInfo(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
@@ -114,7 +128,7 @@ JSValue native_dialogPickFile(JSContext *ctx, JSValue *this_val, int argc, JSVal
 JSValue native_dialogChoice(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
     // usage: dialogChoice(choices : string[] | [key: string, value: string][] | {[key: string]: string})
     // returns: string or empty string
-    const char *result = "";
+    String result;
     if (argc < 1 || !JS_IsObject(ctx, argv[0])) {
         return JS_ThrowTypeError(ctx, "dialogChoice: Choice argument must be object or array.");
     }
@@ -131,7 +145,9 @@ JSValue native_dialogChoice(JSContext *ctx, JSValue *this_val, int argc, JSValue
             if (JS_IsString(ctx, jsvChoice)) {
                 JSCStringBuf sb;
                 const char *s = JS_ToCString(ctx, jsvChoice, &sb);
-                options.push_back({s, [&result, s]() { result = s; }});
+                if (!s) continue;
+                String choice = s;
+                options.push_back({choice, [&result, choice]() { result = choice; }});
             } else if (JS_GetClassID(ctx, jsvChoice) == JS_CLASS_ARRAY) {
                 /* element is expected to be [key, value] */
                 JSValue jsvInnerArrayLength = JS_GetPropertyStr(ctx, jsvChoice, "length");
@@ -143,9 +159,13 @@ JSValue native_dialogChoice(JSContext *ctx, JSValue *this_val, int argc, JSValue
                     JSValue jsvKey = JS_GetPropertyUint32(ctx, jsvChoice, 0);
                     JSValue jsvValue = JS_GetPropertyUint32(ctx, jsvChoice, 1);
                     if (JS_IsString(ctx, jsvKey) && JS_IsString(ctx, jsvValue)) {
-                        JSCStringBuf sb;
-                        const char *key = JS_ToCString(ctx, jsvKey, &sb);
-                        const char *value = JS_ToCString(ctx, jsvValue, &sb);
+                        JSCStringBuf keyBuf;
+                        JSCStringBuf valueBuf;
+                        const char *keyPtr = JS_ToCString(ctx, jsvKey, &keyBuf);
+                        const char *valuePtr = JS_ToCString(ctx, jsvValue, &valueBuf);
+                        if (!keyPtr || !valuePtr) continue;
+                        String key = keyPtr;
+                        String value = valuePtr;
                         options.push_back({key, [value, &result]() { result = value; }});
                     }
                 }
@@ -161,11 +181,14 @@ JSValue native_dialogChoice(JSContext *ctx, JSValue *this_val, int argc, JSValue
             if (key == NULL) break;
             log_d("key: %s", key);
             log_d("prop_count: %d", prop_count);
+            String label = key;
             JSValue jsvVal = JS_GetPropertyStr(ctx, argv[0], key);
             if (JS_IsString(ctx, jsvVal)) {
                 JSCStringBuf sb;
-                const char *val = JS_ToCString(ctx, jsvVal, &sb);
-                options.push_back({key, [val, &result]() { result = val; }});
+                const char *valPtr = JS_ToCString(ctx, jsvVal, &sb);
+                if (!valPtr) continue;
+                String value = valPtr;
+                options.push_back({label, [value, &result]() { result = value; }});
             }
         }
     }
@@ -173,7 +196,7 @@ JSValue native_dialogChoice(JSContext *ctx, JSValue *this_val, int argc, JSValue
     loopOptions(options, MENU_TYPE_REGULAR, "", 0, true);
     options.clear();
 
-    return JS_NewString(ctx, result);
+    return JS_NewString(ctx, result.c_str());
 }
 
 JSValue native_dialogViewFile(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {

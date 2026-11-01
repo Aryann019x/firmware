@@ -1,9 +1,11 @@
 #include "nrf_common.h"
 #include "../../core/mykeyboard.h"
 
-RF24 NRFradio(bruceConfigPins.NRF24_bus.io0, bruceConfigPins.NRF24_bus.cs);
+// Pins are assigned in nrf_start() via NRFradio.begin(...); using -1 here avoids
+// reading bruceConfigPins during static initialization (order is undefined).
+RF24 NRFradio(-1, -1);
 HardwareSerial NRFSerial = HardwareSerial(2); // Uses UART2 for External NRF's
-SPIClass *NRFSPI;
+SPIClass *NRFSPI = nullptr;
 
 void nrf_info() {
     tft.fillScreen(bruceConfig.bgColor);
@@ -23,7 +25,7 @@ void nrf_info() {
         "things go wrong."
     );
     delay(1000);
-    while (!check(AnyKeyPress));
+    while (!check(AnyKeyPress)) { vTaskDelay(20 / portTICK_PERIOD_MS); }
 }
 
 bool nrf_start(NRF24_MODE mode) {
@@ -41,6 +43,14 @@ bool nrf_start(NRF24_MODE mode) {
     };
 
     if (!CHECK_NRF_SPI(mode)) return result;
+
+    // Without CE/CS there is no point in touching the SPI bus: RF24::begin()
+    // would fail and the caller would show a misleading error.
+    if (bruceConfigPins.NRF24_bus.cs == GPIO_NUM_NC || bruceConfigPins.NRF24_bus.io0 == GPIO_NUM_NC) {
+        Serial.println("[NRF24] CE/CS pins are not configured for this board");
+        return false;
+    }
+
     pinMode(bruceConfigPins.NRF24_bus.cs, OUTPUT);
     digitalWrite(bruceConfigPins.NRF24_bus.cs, HIGH);
     pinMode(bruceConfigPins.NRF24_bus.io0, OUTPUT);
@@ -74,24 +84,48 @@ bool nrf_start(NRF24_MODE mode) {
     );
     delay(10);
 
-    if (NRFradio.begin(
+    if (!NRFradio.begin(
             NRFSPI,
             rf24_gpio_pin_t(bruceConfigPins.NRF24_bus.io0),
             rf24_gpio_pin_t(bruceConfigPins.NRF24_bus.cs)
         )) {
-        result = true;
-    } else {
+        Serial.println("[NRF24] begin() failed - check SPI pins and wiring");
         return false;
     }
-    return result;
+
+    // RF24::begin() only validates the pins/SPI object.  It does not verify that
+    // a chip is really answering, so a missing module used to look like success
+    // and every feature silently did nothing.  Retry once, then report honestly.
+    bool chipFound = NRFradio.isChipConnected();
+    if (!chipFound) {
+        delay(50);
+        chipFound = NRFradio.isChipConnected();
+    }
+    if (!chipFound) {
+        Serial.println(
+            "[NRF24] chip not detected - check 3.3V, GND, CE/CS and SPI wiring "
+            "(MISO may be floating)"
+        );
+        return false;
+    }
+
+    // Sane, explicit defaults.  Individual features override what they need.
+    NRFradio.setChannel(76);
+    NRFradio.setDataRate(RF24_1MBPS);
+    NRFradio.setPALevel(RF24_PA_MAX);
+    NRFradio.setAutoAck(true);
+    NRFradio.setCRCLength(RF24_CRC_16);
+
+    Serial.println("[NRF24] radio detected and initialized");
+    return true;
 }
 
 NRF24_MODE nrf_setMode() {
     NRF24_MODE mode = NRF_MODE_DISABLED;
     options = {
-        {"SPI Mode",  [&]() { mode = NRF_MODE_SPI; } },
-        {"SPI UART",  [&]() { mode = NRF_MODE_UART; }},
-        {"SPI BOTH",  [&]() { mode = NRF_MODE_BOTH; }},
+        {"SPI Mode",   [&]() { mode = NRF_MODE_SPI; } },
+        {"UART Mode",  [&]() { mode = NRF_MODE_UART; }},
+        {"SPI + UART", [&]() { mode = NRF_MODE_BOTH; }},
         {"Main Menu", [=]() { returnToMenu = true; } }
     };
     loopOptions(options);

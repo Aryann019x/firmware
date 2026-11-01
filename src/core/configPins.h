@@ -227,12 +227,12 @@ public:
     void setLoRaPins(SPIPins value);
     void setW5500Pins(SPIPins value);
 #endif
-    void setSpiPins(SPIPins value);
-    void setI2CPins(I2CPins value);
-    void setUARTPins(UARTPins value);
-    void validateSpiPins(SPIPins value);
-    void validateI2CPins(I2CPins value);
-    void validateUARTPins(UARTPins value);
+    void setSpiPins(SPIPins &value);
+    void setI2CPins(I2CPins &value);
+    void setUARTPins(UARTPins &value);
+    void validateSpiPins(SPIPins &value);
+    void validateI2CPins(I2CPins &value);
+    void validateUARTPins(UARTPins &value);
 
     // Screen Rotation
     void setRotation(int value);

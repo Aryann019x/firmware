@@ -22,15 +22,15 @@ static JSValue keyboard_wrapper(JSContext *ctx, JSValue *argv, int argc, Keyboar
         int max_size = 0;
         if (JS_ToInt32(ctx, &max_size, argv[0])) return JS_EXCEPTION;
         const char *msg = "";
+        JSCStringBuf msgBuf;
         if (argc > 1 && JS_IsString(ctx, argv[1])) {
-            JSCStringBuf buf;
-            msg = JS_ToCString(ctx, argv[1], &buf);
+            msg = JS_ToCString(ctx, argv[1], &msgBuf);
         }
         bool mask_input = JS_IsBool(argv[argc - 1]) ? JS_ToBool(ctx, argv[argc - 1]) : false;
         switch (type) {
-            case KEYBOARD_NORMAL: result = keyboard("", max_size, msg, mask_input); break;
-            case KEYBOARD_HEX: result = hex_keyboard("", max_size, msg, mask_input); break;
-            case KEYBOARD_NUM: result = num_keyboard("", max_size, msg, mask_input); break;
+            case KEYBOARD_NORMAL: result = keyboard("", max_size, msg ? msg : "", mask_input); break;
+            case KEYBOARD_HEX: result = hex_keyboard("", max_size, msg ? msg : "", mask_input); break;
+            case KEYBOARD_NUM: result = num_keyboard("", max_size, msg ? msg : "", mask_input); break;
         }
     } else if (JS_IsString(ctx, argv[0])) {
         JSCStringBuf buf0;

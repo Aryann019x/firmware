@@ -2,6 +2,7 @@
 #include "rf_utils.h"
 #include "structs.h"
 #include <RCSwitch.h>
+#include <esp_err.h>
 
 static bool spectrum_rmt_rx_done_callback(
     rmt_channel_t *channel, const rmt_rx_done_event_data_t *edata, void *user_data
@@ -28,24 +29,50 @@ void draw_tf_spectrum_grid() {
 void rf_spectrum() {
     tft.fillScreen(bruceConfig.bgColor);
     draw_tf_spectrum_grid();
-    rmt_channel_handle_t rx_ch = NULL;
-    rx_ch = setup_rf_rx();
+    rmt_channel_handle_t rx_ch = setup_rf_rx();
     if (rx_ch == NULL) return;
     ESP_LOGI("RMT_SPECTRUM", "register RX done callback");
     QueueHandle_t receive_queue = xQueueCreate(1, sizeof(rmt_rx_done_event_data_t));
-    assert(receive_queue);
+    if (receive_queue == NULL) {
+        displayError("RMT queue error", true);
+        rmt_del_channel(rx_ch);
+        deinitRfModule();
+        return;
+    }
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = spectrum_rmt_rx_done_callback,
     };
-    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_ch, &cbs, receive_queue));
-    ESP_ERROR_CHECK(rmt_enable(rx_ch));
+    esp_err_t rmtErr = rmt_rx_register_event_callbacks(rx_ch, &cbs, receive_queue);
+    if (rmtErr != ESP_OK) {
+        Serial.printf("[RF] register callbacks failed: %s\n", esp_err_to_name(rmtErr));
+        vQueueDelete(receive_queue);
+        rmt_del_channel(rx_ch);
+        deinitRfModule();
+        return;
+    }
+    rmtErr = rmt_enable(rx_ch);
+    if (rmtErr != ESP_OK) {
+        Serial.printf("[RF] rmt_enable failed: %s\n", esp_err_to_name(rmtErr));
+        vQueueDelete(receive_queue);
+        rmt_del_channel(rx_ch);
+        deinitRfModule();
+        return;
+    }
     rmt_receive_config_t receive_config = {
         .signal_range_min_ns = 3000,     // 6us minimum signal duration
         .signal_range_max_ns = 12000000, // 24ms maximum signal duration
     };
     rmt_symbol_word_t item[64];
     rmt_rx_done_event_data_t rx_data;
-    ESP_ERROR_CHECK(rmt_receive(rx_ch, item, sizeof(item), &receive_config));
+    rmtErr = rmt_receive(rx_ch, item, sizeof(item), &receive_config);
+    if (rmtErr != ESP_OK) {
+        Serial.printf("[RF] rmt_receive failed: %s\n", esp_err_to_name(rmtErr));
+        rmt_disable(rx_ch);
+        rmt_del_channel(rx_ch);
+        vQueueDelete(receive_queue);
+        deinitRfModule();
+        return;
+    }
 
     size_t rx_size = 0;
     while (1) {
@@ -71,7 +98,11 @@ void rf_spectrum() {
                 tft.drawLine(lineX, startY, lineX, endY, bruceConfig.priColor);
             }
 
-            ESP_ERROR_CHECK(rmt_receive(rx_ch, item, sizeof(item), &receive_config));
+            rmtErr = rmt_receive(rx_ch, item, sizeof(item), &receive_config);
+            if (rmtErr != ESP_OK) {
+                Serial.printf("[RF] rmt_receive failed: %s\n", esp_err_to_name(rmtErr));
+                break;
+            }
             rx_size = 0;
         }
         // Checks to leave while

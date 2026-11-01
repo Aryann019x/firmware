@@ -11,13 +11,20 @@
 
 class IrRead {
 public:
-    // IRrecv irrecv = IRrecv(bruceConfigPins.irRx);
-    IRrecv irrecv = IRrecv(bruceConfigPins.irRx, SAFE_STACK_BUFFER_SIZE / 2, 50);
+    // The receiver must be created *after* the RX pin is chosen in setup().
+    // Creating it here binds it to the boot-time pin and ignores later changes.
+    IRrecv *irrecv = nullptr;
 
     /////////////////////////////////////////////////////////////////////////////////////
     // Constructor
     /////////////////////////////////////////////////////////////////////////////////////
     IrRead(bool headless_mode = false, bool raw_mode = false);
+    ~IrRead();
+
+    // The receiver and raw buffer are owned pointers: copying the object would
+    // leave two instances sharing them and double-free on destruction.
+    IrRead(const IrRead &) = delete;
+    IrRead &operator=(const IrRead &) = delete;
 
     ///////////////////////////////////////////////////////////////////////////////////
     // Arduino Life Cycle
@@ -31,8 +38,8 @@ public:
 private:
     bool _read_signal = false;
     decode_results results;
-    uint16_t *rawcode;
-    uint16_t raw_data_len;
+    uint16_t *rawcode = nullptr;
+    uint16_t raw_data_len = 0;
     int signals_read = 0;
     int button_pos = 0;
     String strDeviceContent = "";

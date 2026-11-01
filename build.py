@@ -33,11 +33,60 @@ boot_bin = build_dir / "bootloader.bin"
 part_bin = build_dir / "partitions.bin"
 app_bin  = build_dir / "firmware.bin"
 
+def q(p): return f'\"{p}\"'
+
+# ---- Locate or generate bootloader.bin from framework pre-built ELF ----
+# PlatformIO may not produce a standalone bootloader.bin for custom boards.
+# The framework ships pre-built bootloader ELFs; convert the right one to .bin.
+def _ensure_bootloader():
+    if boot_bin.exists():
+        return
+    flash_mode = board_config.get("build.flash_mode", "dio")
+    freq_raw = str(board_config.get("build.f_flash", "40000000")).rstrip('Ll')
+    freq_mhz = int(freq_raw) // 1000000
+    elf_name = f"bootloader_{flash_mode}_{freq_mhz}m.elf"
+    framework_pkg = senv.PioPlatform().get_package_dir("framework-arduinoespressif32-libs")
+    elf_path = Path(framework_pkg) / mcu / "bin" / elf_name
+    if not elf_path.exists():
+        # Fallback: try dio_40m which works for most ESP32 boards
+        elf_path = Path(framework_pkg) / mcu / "bin" / "bootloader_dio_40m.elf"
+    if not elf_path.exists():
+        print(f"[merge_bin] Warning: No bootloader ELF found in {framework_pkg}/{mcu}/bin/")
+        print(f"[merge_bin] Tried: {elf_name}, fallback: bootloader_dio_40m.elf")
+        return
+    print(f"[merge_bin] Converting bootloader ELF -> {boot_bin}")
+    print(f"  Source: {elf_path}")
+    # Use esptool elf2image to produce a raw bootloader binary
+    esptool_cmd = " ".join([
+        q(python_exe), "-m", "esptool",
+        "--chip", chip_arg,
+        "elf2image",
+        "--flash_mode", flash_mode,
+        "--flash_size", "4MB",
+        "-o", q(str(boot_bin)),
+        q(str(elf_path)),
+    ])
+    rc = env.Execute(esptool_cmd)
+    if rc != 0 or not boot_bin.exists():
+        # esptool elf2image may produce filename prefixed output; try objcopy fallback
+        print(f"[merge_bin] esptool elf2image failed (rc={rc}), trying objcopy...")
+        toolchain_pkg = senv.PioPlatform().get_package_dir("toolchain-xtensa-esp-elf")
+        objcopy = Path(toolchain_pkg) / "bin" / "xtensa-esp32-elf-objcopy"
+        objcopy_cmd = f'"{objcopy}" -O binary --only-section .text --only-section .data --only-section .rodata --only-section .bss "{elf_path}" "{boot_bin}"'
+        rc = env.Execute(objcopy_cmd)
+        if rc != 0 or not boot_bin.exists():
+            print(f"[merge_bin] objcopy also failed; bootloader will be skipped")
+        else:
+            print(f"[merge_bin] objcopy succeeded -> {boot_bin}")
+    else:
+        # esptool may produce bootloader.bin directly or as a sub-file
+        if boot_bin.exists():
+            print(f"[merge_bin] elf2image succeeded -> {boot_bin}")
+
 out_bin  = proj_dir / f"Bruce-{pioenv}.bin"
 
 # Esptool from PlatformIO + Python executable
 esptool_pkg = senv.PioPlatform().get_package_dir("tool-esptoolpy")
-esptool_py  = str(Path(esptool_pkg) / "esptool")
 python_exe  = senv.get("PYTHONEXE", "python")
 
 chip_arg = mcu if mcu else "esp32"
@@ -48,6 +97,9 @@ def _merge_bins_callback(target, source, env):
     Merges bootloader, partitions, and app into a single binary.
     NOTE: This function signature must be (target, source, env) so SCons can call it.
     """
+    # Ensure bootloader.bin exists (convert from framework ELF if needed)
+    _ensure_bootloader()
+
     # Check files
     missing = [p for p in [boot_bin, part_bin, app_bin] if not p.exists()]
     if missing:
@@ -55,9 +107,6 @@ def _merge_bins_callback(target, source, env):
         for p in missing:
             print(f" - {p}")
         return
-
-    # Quote paths for Windows safety
-    def q(p): return f"\"{p}\""
 
     # ---- Read partition CSV to get test partition size and ota_0 offset ----
     part_csv_name = board_config.get("build.partitions") or env.GetProjectOption(
@@ -99,7 +148,7 @@ def _merge_bins_callback(target, source, env):
             env.Exit(1)
 
     cmd = " ".join([
-        q(python_exe), "-m", "platformio", "pkg", "exec", "-p", q("tool-esptoolpy"), "--", "esptool.py",
+        q(python_exe), "-m", "esptool",
         "--chip", chip_arg,
         "merge-bin",
         "--output", q(out_bin),

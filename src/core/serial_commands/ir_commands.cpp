@@ -25,13 +25,17 @@ uint32_t irRxCallback(cmd *c) {
     } else {
         i = new IrRead(true); // true -> headless mode
     }
+    if (i == nullptr) {
+        serialDevice->println("IR receiver init failed");
+        return false;
+    }
 
     serialDevice->println("Waiting for signal...");
     String r = i->loop_headless(10); // 10s timeout
+    delete i;
     if (r.length() == 0) return false;
 
     serialDevice->println(r);
-    delete i;
     return true;
 }
 

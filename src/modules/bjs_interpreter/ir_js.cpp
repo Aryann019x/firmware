@@ -21,10 +21,11 @@ JSValue native_irTransmitFile(JSContext *ctx, JSValue *this_val, int argc, JSVal
 JSValue native_irTransmit(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
     if (argc < 1 || !JS_IsString(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "irTransmit(data:string,protocol?:string,bits?:int) required");
-    JSCStringBuf sb;
-    const char *data = JS_ToCString(ctx, argv[0], &sb);
+    JSCStringBuf dataBuf;
+    JSCStringBuf protocolBuf;
+    const char *data = JS_ToCString(ctx, argv[0], &dataBuf);
     const char *protocol = "NEC";
-    if (argc > 1 && JS_IsString(ctx, argv[1])) { protocol = JS_ToCString(ctx, argv[1], &sb); }
+    if (argc > 1 && JS_IsString(ctx, argv[1])) { protocol = JS_ToCString(ctx, argv[1], &protocolBuf); }
     int bits = 32;
     if (argc > 2 && JS_IsNumber(ctx, argv[2])) JS_ToInt32(ctx, &bits, argv[2]);
     bool r = sendDecodedCommand(protocol, data, bits);
@@ -38,7 +39,7 @@ JSValue native_irRead(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     // errors
     // This function is registered twice in stdlib: normal and raw. The "raw"
     // variant will be a separate C function (native_irReadRaw) that passes raw=true.
-    IrRead irRead = IrRead(true, 0);
+    IrRead irRead(true, 0);
     int timeout = 10;
     if (argc > 0 && JS_IsNumber(ctx, argv[0])) JS_ToInt32(ctx, &timeout, argv[0]);
     String result = irRead.loop_headless(timeout);
@@ -46,7 +47,7 @@ JSValue native_irRead(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 }
 
 JSValue native_irReadRaw(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv) {
-    IrRead irRead = IrRead(true, 1);
+    IrRead irRead(true, 1);
     int timeout = 10;
     if (argc > 0 && JS_IsNumber(ctx, argv[0])) JS_ToInt32(ctx, &timeout, argv[0]);
     String result = irRead.loop_headless(timeout);

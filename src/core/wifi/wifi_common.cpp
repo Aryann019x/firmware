@@ -9,8 +9,27 @@
 #include <esp_netif.h>
 #include <globals.h>
 
-static TaskHandle_t timezoneTaskHandle = NULL;
+static volatile bool timezoneTaskRunning = false;
+static portMUX_TYPE timezoneTaskMux = portMUX_INITIALIZER_UNLOCKED;
 static bool wifiTransitioning = false;
+
+// Starts the one-shot timezone task at most once.  The old implementation
+// stored the FreeRTOS task handle and cleared it from inside the task, which
+// could race with xTaskCreate() writing the handle and leave a stale non-NULL
+// value forever.
+static void startTimezoneTask() {
+    portENTER_CRITICAL(&timezoneTaskMux);
+    const bool shouldStart = !timezoneTaskRunning;
+    if (shouldStart) { timezoneTaskRunning = true; }
+    portEXIT_CRITICAL(&timezoneTaskMux);
+    if (!shouldStart) return;
+
+    if (xTaskCreate(updateTimezoneTask, "updateTimezone", 4096, NULL, 1, NULL) != pdPASS) {
+        portENTER_CRITICAL(&timezoneTaskMux);
+        timezoneTaskRunning = false;
+        portEXIT_CRITICAL(&timezoneTaskMux);
+    }
+}
 
 void ensureWifiPlatform() {
     static bool netifInitialized = false;
@@ -23,7 +42,14 @@ void ensureWifiPlatform() {
     portEXIT_CRITICAL(&platformMux);
 
     if (needNetif) {
-        ESP_ERROR_CHECK(esp_netif_init());
+        // The Arduino WiFi stack may have initialized netif already.  Calling
+        // esp_netif_init() twice returns ESP_ERR_INVALID_STATE, and the old
+        // ESP_ERROR_CHECK() turned that into an abort()/boot loop.
+        esp_err_t err = esp_netif_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            Serial.printf("[WiFi] esp_netif_init failed: %s\n", esp_err_to_name(err));
+            return;
+        }
         portENTER_CRITICAL(&platformMux);
         netifInitialized = true;
         portEXIT_CRITICAL(&platformMux);
@@ -31,7 +57,10 @@ void ensureWifiPlatform() {
 
     if (needLoop) {
         esp_err_t err = esp_event_loop_create_default();
-        if (err != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(err); }
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            Serial.printf("[WiFi] event loop creation failed: %s\n", esp_err_to_name(err));
+            return;
+        }
         portENTER_CRITICAL(&platformMux);
         eventLoopCreated = true;
         portEXIT_CRITICAL(&platformMux);
@@ -68,9 +97,7 @@ bool _wifiConnect(const String &ssid, int encryption) {
         bruceConfig.addWifiCredential(ssid, password);
 
         // Start timezone update in background if not already running
-        if (timezoneTaskHandle == NULL) {
-            xTaskCreate(updateTimezoneTask, "updateTimezone", 4096, NULL, 1, &timezoneTaskHandle);
-        }
+        startTimezoneTask();
     }
 
     delay(200);
@@ -112,8 +139,25 @@ bool _connectToWifiNetwork(const String &ssid, const String &pwd) {
 
 bool _setupAP() {
     IPAddress AP_GATEWAY(172, 0, 0, 1);
-    WiFi.softAPConfig(AP_GATEWAY, AP_GATEWAY, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(bruceConfig.wifiAp.ssid, bruceConfig.wifiAp.pwd, 6, 0, 4, false);
+    // Callers may arrive here right after wifiDisconnect(), which leaves the
+    // radio in WIFI_OFF.  softAP()/softAPConfig() are only reliable once AP
+    // mode is selected.
+    if (!WiFi.mode(WIFI_MODE_AP)) {
+        Serial.println("[WiFi] failed to select AP mode");
+        wifiConnected = false;
+        return false;
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    if (!WiFi.softAPConfig(AP_GATEWAY, AP_GATEWAY, IPAddress(255, 255, 255, 0))) {
+        Serial.println("[WiFi] softAPConfig failed");
+        wifiConnected = false;
+        return false;
+    }
+    if (!WiFi.softAP(bruceConfig.wifiAp.ssid, bruceConfig.wifiAp.pwd, 6, 0, 4, false)) {
+        Serial.println("[WiFi] softAP failed");
+        wifiConnected = false;
+        return false;
+    }
     wifiIP = WiFi.softAPIP().toString(); // update global var
     Serial.println("IP: " + wifiIP);
     wifiConnected = true;
@@ -160,8 +204,14 @@ bool wifiConnectMenu(wifi_mode_t mode) {
             bool refresh_scan = false;
             do {
                 displayTextLine("Scanning..");
+                WiFi.scanDelete();
                 nets = WiFi.scanNetworks();
                 options = {};
+                if (nets < 0) {
+                    displayError("WiFi scan failed", true);
+                    WiFi.scanDelete();
+                    break;
+                }
                 for (int i = 0; i < nets; i++) {
                     if (options.size() < 250) {
                         String ssid = WiFi.SSID(i);
@@ -195,6 +245,10 @@ bool wifiConnectMenu(wifi_mode_t mode) {
                                    }});
                 addOptionToMainMenu();
 
+                // Option labels are copied into the Option objects, so the raw
+                // scan results can be released before blocking in the menu.
+                WiFi.scanDelete();
+
                 loopOptions(options);
                 options.clear();
 
@@ -223,7 +277,12 @@ bool wifiConnectMenu(wifi_mode_t mode) {
 }
 
 void wifiConnectTask(void *pvParameters) {
-    if (WiFi.status() == WL_CONNECTED) return;
+    // A FreeRTOS task must never fall off the end of its entry function; doing
+    // so aborts the device.  Delete the task explicitly on every early exit.
+    if (WiFi.status() == WL_CONNECTED) {
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Check if WiFi is in transition
     if (wifiTransitioning) {
@@ -233,31 +292,45 @@ void wifiConnectTask(void *pvParameters) {
 
     WiFi.mode(WIFI_MODE_STA);
     int nets = WiFi.scanNetworks();
-    String ssid;
-    String pwd;
+    if (nets < 0) {
+        Serial.println("[WiFi] background scan failed");
+        vTaskDelete(NULL);
+        return;
+    }
 
+    // Copy credentials before connecting: WiFi.begin() invalidates the scan
+    // results that are being iterated.
+    std::vector<std::pair<String, String>> known;
+    known.reserve(nets);
     for (int i = 0; i < nets; i++) {
-        ssid = WiFi.SSID(i);
-        pwd = bruceConfig.getWifiPassword(ssid);
+        String ssid = WiFi.SSID(i);
+        if (ssid.isEmpty()) continue;
+        String pwd = bruceConfig.getWifiPassword(ssid);
         if (pwd == "") continue;
+        known.emplace_back(ssid, pwd);
+    }
+    WiFi.scanDelete();
 
-        WiFi.begin(ssid, pwd);
+    for (const auto &net : known) {
+        WiFi.begin(net.first, net.second);
+        bool connectedNow = false;
         for (int i = 0; i < 50; i++) {
             if (WiFi.status() == WL_CONNECTED) {
                 wifiConnected = true;
                 wifiIP = WiFi.localIP().toString();
 
                 // Start timezone update in background if not already running
-                if (timezoneTaskHandle == NULL) {
-                    xTaskCreate(updateTimezoneTask, "updateTimezone", 4096, NULL, 1, &timezoneTaskHandle);
-                }
+                startTimezoneTask();
                 drawStatusBar();
+                connectedNow = true;
                 break;
             }
             vTaskDelay(100 / portTICK_RATE_MS);
         }
+        // Stop after the first successful connection; otherwise the next
+        // WiFi.begin() would immediately tear down the working link.
+        if (connectedNow) break;
     }
-    WiFi.scanDelete();
 
     vTaskDelete(NULL);
     return;
@@ -266,7 +339,11 @@ void wifiConnectTask(void *pvParameters) {
 String checkMAC() { return String(WiFi.macAddress()); }
 
 bool wifiConnecttoKnownNet(void) {
-    if (WiFi.isConnected()) return true; // safeguard
+    if (WiFi.isConnected()) { // already connected: keep the global state in sync
+        wifiConnected = true;
+        wifiIP = WiFi.localIP().toString();
+        return true;
+    }
     
     // Check if WiFi is in transition
     if (wifiTransitioning) {
@@ -276,24 +353,40 @@ bool wifiConnecttoKnownNet(void) {
     }
     
     bool result = false;
-    int nets;
-    // WiFi.mode(WIFI_MODE_STA);
+    // The scan/connect below needs STA mode.  Leaving the radio in WIFI_OFF
+    // makes scanNetworks() fail with a negative result.
+    if (!WiFi.mode(WIFI_MODE_STA)) {
+        displayError("WiFi mode failed", true);
+        return false;
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
     displayTextLine("Scanning Networks..");
     WiFi.disconnect(true, true);
     vTaskDelay(10 / portTICK_PERIOD_MS);
-    nets = WiFi.scanNetworks();
+    int nets = WiFi.scanNetworks();
+    if (nets < 0) {
+        displayError("WiFi scan failed", true);
+        return false;
+    }
+
+    // Snapshot known networks, then release the scan buffer before connecting.
+    std::vector<std::pair<String, String>> known;
+    known.reserve(nets);
     for (int i = 0; i < nets; i++) {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
         String ssid = WiFi.SSID(i);
+        if (ssid.isEmpty()) continue;
         String password = bruceConfig.getWifiPassword(ssid);
-        if (password != "") {
-            Serial.println("Connecting to: " + ssid);
-            result = _connectToWifiNetwork(ssid, password);
-        }
+        if (password != "") known.emplace_back(ssid, password);
+    }
+    WiFi.scanDelete();
+
+    for (const auto &net : known) {
+        Serial.println("Connecting to: " + net.first);
+        result = _connectToWifiNetwork(net.first, net.second);
         // Maybe it finds a known network and can't connect, then try the next
         // until it gets connected (or not)
         if (result) {
-            Serial.println("Connected to: " + ssid);
+            Serial.println("Connected to: " + net.first);
             break;
         }
     }
@@ -302,9 +395,7 @@ bool wifiConnecttoKnownNet(void) {
         wifiIP = WiFi.localIP().toString();
 
         // Start timezone update in background if not already running
-        if (timezoneTaskHandle == NULL) {
-            xTaskCreate(updateTimezoneTask, "updateTimezone", 4096, NULL, 1, &timezoneTaskHandle);
-        }
+        startTimezoneTask();
     }
     return result;
 }
@@ -316,7 +407,9 @@ void updateTimezoneTask(void *pvParameters) {
     // Only update timezone if WiFi is still connected
     if (WiFi.isConnected() && wifiConnected) { updateClockTimezone(); }
 
-    // Clear the task handle before deleting
-    timezoneTaskHandle = NULL;
+    // Let a later connection start a fresh timezone update.
+    portENTER_CRITICAL(&timezoneTaskMux);
+    timezoneTaskRunning = false;
+    portEXIT_CRITICAL(&timezoneTaskMux);
     vTaskDelete(NULL);
 }

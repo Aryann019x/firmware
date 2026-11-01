@@ -1092,7 +1092,7 @@ void setIrTxRepeats() {
 int gsetIrRxPin(bool set) {
     int result = bruceConfigPins.irRx;
 
-    if (result > 45) bruceConfigPins.setIrRxPin(GROVE_SCL);
+    if (result < 0 || result > 48) bruceConfigPins.setIrRxPin(RXLED);
     if (set) {
         options.clear();
         std::vector<std::pair<const char *, int>> pins;

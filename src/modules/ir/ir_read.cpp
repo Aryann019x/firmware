@@ -55,23 +55,80 @@ IrRead::IrRead(bool headless_mode, bool raw_mode) {
     raw = raw_mode;
     setup();
 }
+
+IrRead::~IrRead() {
+    if (rawcode != nullptr) {
+        delete[] rawcode;
+        rawcode = nullptr;
+    }
+    if (irrecv != nullptr) {
+        irrecv->disableIRIn();
+        delete irrecv;
+        irrecv = nullptr;
+    }
+}
+
 bool quickloop = false;
 
 void IrRead::setup() {
-    irrecv.enableIRIn();
-
 #ifdef USE_BOOST /// ENABLE 5V OUTPUT
     PPM.enableOTG();
 #endif
-    // Checks if irRx pin is properly set
+
+    // Validate the configured RX pin *before* creating the receiver.  The old
+    // code enabled IRrecv first and then opened the pin picker, so a new pin
+    // only took effect after a reboot.
+    bool pinValid = false;
     const std::vector<std::pair<String, int>> pins = IR_RX_PINS;
-    int count = 0;
-    for (auto pin : pins) {
-        if (pin.second == bruceConfigPins.irRx) count++;
+    for (const auto &pin : pins) {
+        if (pin.second == bruceConfigPins.irRx) {
+            pinValid = true;
+            break;
+        }
     }
-    if (count == 0) gsetIrRxPin(true); // Open dialog to choose irRx pin
+    if (!pinValid) {
+        if (headless) {
+            displayError("No valid IR RX pin", true);
+            return;
+        }
+        gsetIrRxPin(true); // Open dialog to choose irRx pin
+        // The dialog may have been cancelled: re-validate before listening.
+        pinValid = false;
+        for (const auto &pin : pins) {
+            if (pin.second == bruceConfigPins.irRx) {
+                pinValid = true;
+                break;
+            }
+        }
+        if (!pinValid) {
+            displayError("No valid IR RX pin", true);
+            return;
+        }
+    }
+
+    if (bruceConfigPins.irRx < 0) {
+        displayError("No IR RX pin configured", true);
+        return;
+    }
 
     setup_ir_pin(bruceConfigPins.irRx, INPUT_PULLUP);
+
+    // Recreate the receiver with the final pin.  This also makes a pin change
+    // from the settings menu take effect immediately.
+    if (irrecv != nullptr) {
+        irrecv->disableIRIn();
+        delete irrecv;
+        irrecv = nullptr;
+    }
+    irrecv = new IRrecv(bruceConfigPins.irRx, SAFE_STACK_BUFFER_SIZE / 2, 50);
+    if (irrecv == nullptr) {
+        displayError("IR receiver init failed", true);
+        return;
+    }
+    // This IRremoteESP8266 fork returns void; a failed start shows up as
+    // decode() never producing results, which read_signal() handles.
+    irrecv->enableIRIn();
+
     if (headless) return;
     // else
     returnToMenu = true; // make sure menu is redrawn when quitting in any point
@@ -123,6 +180,10 @@ void IrRead::setup() {
 }
 
 void IrRead::loop() {
+    // begin() can return early when no valid RX pin is configured.  Never
+    // dereference a receiver that was not created.
+    if (irrecv == nullptr) { return; }
+
     while (1) {
         if (check(EscPress)) {
             returnToMenu = true;
@@ -139,6 +200,10 @@ void IrRead::loop() {
         if (check(PrevPress)) discard_signal();
 
         read_signal();
+
+        // decode() polls with a 50 ms timeout; still yield once per pass so
+        // the idle task can feed the watchdog during long capture sessions.
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
@@ -146,7 +211,7 @@ void IrRead::begin() {
     _read_signal = false;
 
     display_banner();
-    if (quickloop) {
+    if (quickloop && button_pos < (int)quickButtons.size()) {
         padprintln("Waiting for signal of button: " + String(quickButtons[button_pos]));
     } else {
         padprintln("Waiting for signal...");
@@ -187,7 +252,7 @@ void IrRead::display_btn_options() {
 }
 
 void IrRead::read_signal() {
-    if (_read_signal || !irrecv.decode(&results)) return;
+    if (_read_signal || irrecv == nullptr || !irrecv->decode(&results)) return;
 
     _read_signal = true;
 
@@ -209,7 +274,7 @@ void IrRead::read_signal() {
 
 void IrRead::discard_signal() {
     if (!_read_signal) return;
-    irrecv.resume();
+    if (irrecv != nullptr) irrecv->resume();
     begin();
 }
 
@@ -219,7 +284,11 @@ void IrRead::save_signal() {
         String btn_name = keyboard("Btn" + String(signals_read), 30, "Btn name:");
         append_to_file_str(btn_name);
     } else {
-        append_to_file_str(quickButtons[button_pos]);
+        if (button_pos < (int)quickButtons.size()) {
+            append_to_file_str(quickButtons[button_pos]);
+        } else {
+            return;
+        }
     }
     signals_read++;
     if (quickloop) button_pos++;
@@ -243,6 +312,17 @@ String IrRead::parse_raw_signal() {
 
     rawcode = resultToRawArray(&results);
     raw_data_len = getCorrectedRawLength(&results);
+
+    // resultToRawArray() returns nullptr when the capture is empty or the
+    // allocation fails.  Dereferencing it here used to crash IR Read.
+    if (rawcode == nullptr || raw_data_len == 0) {
+        if (rawcode != nullptr) {
+            delete[] rawcode;
+            rawcode = nullptr;
+        }
+        raw_data_len = 0;
+        return "";
+    }
 
     String signal_code = "";
 
@@ -367,17 +447,25 @@ void IrRead::save_device() {
         displaySuccess("File saved to " + String((fs == &SD) ? "SD Card" : "LittleFS") + ".", true);
         signals_read = 0;
         strDeviceContent = "";
+        if (quickloop) {
+            // The quick-remote sequence is complete: stop indexing the button
+            // list, otherwise begin() reads past the end of the vector.
+            quickloop = false;
+            button_pos = 0;
+        }
     } else displayError(fs ? "Error writing file." : "No storage available.", true);
 
     delay(1000);
 
-    irrecv.resume();
+    if (irrecv != nullptr) irrecv->resume();
     begin();
 }
 
 String IrRead::loop_headless(int max_loops) {
 
-    while (!irrecv.decode(&results)) { // MEMO: default timeout is 15ms
+    if (irrecv == nullptr) return "";
+
+    while (!irrecv->decode(&results)) { // MEMO: default timeout is 15ms
         max_loops -= 1;
         if (max_loops <= 0) {
             Serial.println("timeout");
@@ -387,7 +475,7 @@ String IrRead::loop_headless(int max_loops) {
         // delay(50);
     }
 
-    irrecv.disableIRIn();
+    irrecv->disableIRIn();
 
     if (!raw && results.decode_type == decode_type_t::UNKNOWN) {
         Serial.println("# decoding failed, try raw mode");

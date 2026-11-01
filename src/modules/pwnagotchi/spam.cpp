@@ -14,6 +14,8 @@ Thanks to @bmorcelli for his help doing a better code.
 #include "core/display.h"
 #include "core/mykeyboard.h"
 #include "core/sd_functions.h"
+#include "core/wifi/webInterface.h"
+#include "core/wifi/wifi_common.h"
 #include "spam.h"
 #include "ui.h"
 
@@ -22,6 +24,18 @@ volatile bool spamRunning = false;
 volatile bool stop_beacon = false;
 volatile bool dos_pwnd = false;
 volatile bool change_identity = false;
+
+// Signalled by beacon_task right before it deletes itself, so the UI can wait
+// for the radio task to stop before the next WiFi feature reconfigures it.
+// The semaphore is created once and never deleted: deleting it while the task
+// is still winding down would be a use-after-free.
+static StaticSemaphore_t beaconDoneSemBuffer;
+static SemaphoreHandle_t beaconDoneSem = nullptr;
+
+static SemaphoreHandle_t ensureBeaconDoneSem() {
+    if (beaconDoneSem == nullptr) { beaconDoneSem = xSemaphoreCreateBinaryStatic(&beaconDoneSemBuffer); }
+    return beaconDoneSem;
+}
 
 // Global arrays to hold the faces and names
 const char *faces[30]; // Increase size if needed
@@ -156,6 +170,7 @@ void beacon_task(void *pvParameters) {
         }
     }
 
+    if (beaconDoneSem != nullptr) { xSemaphoreGive(beaconDoneSem); }
     vTaskDelete(NULL);
 }
 
@@ -189,6 +204,7 @@ void displaySpamStatus() {
 
         if (check(EscPress)) {
             spamRunning = false; // Adds condition to Stop the beacon_task that is running in the background
+            stop_beacon = true;  // Break out of the current channel/face burst immediately
             break;
         }
         if (check(SelPress)) {
@@ -240,8 +256,14 @@ void displaySpamStatus() {
         vTaskDelay(200 / portTICK_RATE_MS);
         ; // Update the display every 200 ms
     }
-    displayWarning("Stopping.."); // Wait for 1 second for the beacon_task to stop running
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    displayWarning("Stopping..");
+    spamRunning = false;
+    stop_beacon = true;
+    // Wait for the radio task to actually exit.  Without this, beacon frames
+    // kept being transmitted while the next WiFi feature reconfigured the
+    // interface.
+    if (beaconDoneSem != nullptr) { xSemaphoreTake(beaconDoneSem, pdMS_TO_TICKS(5000)); }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
 }
 
 void loadFacesAndNames() {
@@ -369,17 +391,40 @@ void send_pwnagotchi_beacon_main() {
     // Initialiser NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_flash_erase();
         ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
+    if (ret != ESP_OK) {
+        Serial.printf("[Pwnagotchi] NVS init failed: %s\n", esp_err_to_name(ret));
+        displayError("NVS init failed", true);
+        return;
+    }
+
+    // The WebUI owns AsyncTCP callbacks; stopping the radio underneath it can
+    // reboot the device, so tear it down before reconfiguring WiFi.
+    cleanlyStopWebUiForWiFiFeature();
 
     // Initialiser la configuration Wi-Fi
+    ensureWifiPlatform();
+    // The Arduino WiFi stack may already own/start the driver.  Stop it first
+    // so the AP mode below is applied cleanly instead of failing with
+    // ESP_ERR_WIFI_STATE (which used to abort the device).
+    esp_wifi_stop();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    // WiFi may already be initialized by the Arduino stack: that is not an error.
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        displayError("WiFi init failed", true);
+        return;
+    }
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) { Serial.printf("[Pwnagotchi] set_mode failed: %s\n", esp_err_to_name(ret)); }
+    ret = esp_wifi_start();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_STATE) {
+        displayError("WiFi start failed", true);
+        return;
+    }
 
     // Load faces and names from the file
     loadFacesAndNames();
@@ -393,12 +438,25 @@ void send_pwnagotchi_beacon_main() {
 
     // Set the spamRunning flag to true
     spamRunning = true;
+    stop_beacon = false;
 
     // Clear screen
     tft.fillRect(0, 20, tftWidth, tftHeight - 40, bruceConfig.bgColor);
 
+    if (ensureBeaconDoneSem() == nullptr) {
+        spamRunning = false;
+        displayError("Beacon task alloc failed", true);
+        return;
+    }
+    // Drop a completion signal left over from a previous run.
+    xSemaphoreTake(beaconDoneSem, 0);
+
     // Créer la tâche beacon
-    xTaskCreate(&beacon_task, "beacon_task", 4096, NULL, 5, NULL);
+    if (xTaskCreate(&beacon_task, "beacon_task", 6144, NULL, 5, NULL) != pdPASS) {
+        spamRunning = false;
+        displayError("Beacon task start failed", true);
+        return;
+    }
 
     // Display the spam status and wait for user input
     displaySpamStatus();

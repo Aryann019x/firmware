@@ -583,6 +583,9 @@ static void runJammer(NRF24_MODE nrfMode, NrfJamMode jamMode) {
                 break;
             }
         }
+        // Always yield: with dwellMs=0 the channel helpers return immediately
+        // and this loop would otherwise starve the idle task (watchdog reset).
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 
     // ── Cleanup ─────────────────────────────────────────────────
@@ -767,6 +770,9 @@ void nrf_channel_jammer() {
             }
             redraw = true;
         }
+
+        // Keep the UI responsive and feed the idle task while the carrier runs.
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
     if (CHECK_NRF_SPI(mode)) NRFradio.stopConstCarrier();
@@ -921,6 +927,10 @@ void nrf_channel_hopper() {
                         ch = hopCfg.startChannel;
                         hopRedraw = true; // Update display on wrap
                     }
+
+                    // cwChannel(ch, 0) returns immediately, so this loop must
+                    // yield explicitly or it starves the idle task (watchdog).
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
                 }
 
                 if (CHECK_NRF_SPI(nrfMode)) {

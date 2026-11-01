@@ -58,6 +58,18 @@
  */
 
 #include <string.h>
+
+/*
+ * IRAM placement is a speed optimization for the SHA1/PBKDF2 hot path.
+ * The classic ESP32 only has 128 KB of IRAM; inlining these fully unrolled
+ * transforms into it overflows iram0_0_seg at link time. Keep the IRAM_ATTR
+ * placement only on chips with enough IRAM (ESP32-S3 and newer).
+ */
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2)
+#define BRUCE_CRACK_IRAM IRAM_ATTR
+#else
+#define BRUCE_CRACK_IRAM
+#endif
 #include <string>
 
 static const char *TAG = "wifi_crack";
@@ -306,7 +318,7 @@ static bool parse_pcap_handshake(FS &fs, const String &path, HandshakeData &hs) 
    2. sha1_final uses memset+direct writes, NOT the old byte-at-a-
       time while loop (which caused up to 55 sha1_update calls just
       for zero padding per finalize — ~450,000 calls per password).
-   3. hmac_sha1_20: specialized path for exactly 20-byte inputs.
+   3. hmac_sha1_20w: specialized path for exactly 20-byte inputs.
       8190 of 8192 PBKDF2 HMAC calls use 20 bytes. This path
       skips sha1_update/sha1_final entirely — builds the padded
       64-byte block directly and calls sha1_transform once each
@@ -423,7 +435,7 @@ struct Sha1Ctx {
     R4(b, c, d, e, a, 79);
 
 /* ── Variant 1: general — full 16-word load from bytes (used by sha1_update) ── */
-static IRAM_ATTR __attribute__((optimize("O3"), hot)) void
+static BRUCE_CRACK_IRAM __attribute__((optimize("O3"), hot)) void
 sha1_transform(uint32_t state[5], const uint8_t buf[64]) {
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
     uint32_t blk[16], tmp;
@@ -440,7 +452,7 @@ sha1_transform(uint32_t state[5], const uint8_t buf[64]) {
 }
 
 /* ── Variant 2: 20-byte byte-input with fixed SHA1 padding ── */
-static IRAM_ATTR __attribute__((optimize("O3"), hot, always_inline)) void
+static inline BRUCE_CRACK_IRAM __attribute__((optimize("O3"), hot, always_inline)) void
 sha1_transform_20b(uint32_t state[5], const uint8_t data[20]) {
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
     uint32_t blk[16], tmp;
@@ -474,7 +486,7 @@ sha1_transform_20b(uint32_t state[5], const uint8_t data[20]) {
 }
 
 /* ── Variant 3: 20-byte word-input with fixed SHA1 padding ── */
-static IRAM_ATTR __attribute__((optimize("O3"), hot, always_inline)) void
+static inline BRUCE_CRACK_IRAM __attribute__((optimize("O3"), hot, always_inline)) void
 sha1_transform_20w(uint32_t state[5], const uint32_t words[5]) {
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
     uint32_t blk[16];
@@ -587,27 +599,7 @@ static void hmac_sha1_precompute(const uint8_t *key, size_t klen, HmacSha1Pre &o
     sha1_update(out.outer, k_opad, 64);
 }
 
-static IRAM_ATTR __attribute__((optimize("O3"), hot, always_inline)) void
-hmac_sha1_20(const HmacSha1Pre &pre, const uint8_t data[20], uint8_t out[20]) {
-    uint32_t state[5];
-    state[0] = pre.inner.state[0];
-    state[1] = pre.inner.state[1];
-    state[2] = pre.inner.state[2];
-    state[3] = pre.inner.state[3];
-    state[4] = pre.inner.state[4];
-    sha1_transform_20b(state, data);
-    uint32_t ih0 = state[0], ih1 = state[1], ih2 = state[2], ih3 = state[3], ih4 = state[4];
-    const uint32_t ih[5] = {ih0, ih1, ih2, ih3, ih4};
-    state[0] = pre.outer.state[0];
-    state[1] = pre.outer.state[1];
-    state[2] = pre.outer.state[2];
-    state[3] = pre.outer.state[3];
-    state[4] = pre.outer.state[4];
-    sha1_transform_20w(state, ih);
-    sha1_extract(state, out);
-}
-
-static IRAM_ATTR __attribute__((optimize("O3"), hot, always_inline)) void
+static inline BRUCE_CRACK_IRAM __attribute__((optimize("O3"), hot, always_inline)) void
 hmac_sha1_20w(const HmacSha1Pre &pre, const uint32_t data[5], uint32_t out[5]) {
     uint32_t state[5];
     state[0] = pre.inner.state[0];
@@ -643,7 +635,7 @@ static void hmac_sha1_with_pre(const HmacSha1Pre &pre, const uint8_t *data, size
 /* ─────────────────────────────────────────────────────────────
    PBKDF2-HMAC-SHA1 — fully unrolled for dklen=32 (WPA2 PMK)
 ───────────────────────────────────────────────────────────── */
-static IRAM_ATTR __attribute__((optimize("O3"), hot)) void pbkdf2_precomp(
+static BRUCE_CRACK_IRAM __attribute__((optimize("O3"), hot)) void pbkdf2_precomp(
     const HmacSha1Pre &pre, const uint8_t *salt, size_t slen, unsigned int iters, uint8_t *out,
     size_t /* dklen always 32 */
 ) {
@@ -894,6 +886,7 @@ struct WordlistReader {
     }
 
     bool nextLine(char *out, size_t max_len) {
+        if (out == nullptr || max_len == 0) return false;
         while (true) {
             for (size_t i = pos; i < len; i++) {
                 if (buf[i] == '\n') {
@@ -912,6 +905,16 @@ struct WordlistReader {
                 if (buf[pos + rem - 1] == '\r') rem--;
                 size_t cp = (rem < max_len) ? rem : max_len;
                 memcpy(out, buf + pos, cp);
+                out[cp] = '\0';
+                pos = len;
+                return cp > 0;
+            }
+            // A line longer than the whole buffer would make refill() a
+            // no-op (no space) and this loop would spin forever, tripping the
+            // watchdog.  Return the truncated line and drop the rest.
+            if (pos == 0 && len == cap) {
+                size_t cp = (len < max_len) ? len : max_len;
+                memcpy(out, buf, cp);
                 out[cp] = '\0';
                 pos = len;
                 return cp > 0;
@@ -1011,7 +1014,7 @@ void wifi_crack_handshake(const String &wordlist_path, const String &pcap_path) 
         return;
     }
 
-    xTaskCreatePinnedToCore(
+    BaseType_t worker_ok = xTaskCreatePinnedToCore(
         crack_worker_task,
         "crack_w",
         24576, // 24KB: covers blk[16] + Sha1Ctx frames nested 5 deep
@@ -1020,6 +1023,17 @@ void wifi_crack_handshake(const String &wordlist_path, const String &pcap_path) 
         NULL,
         0 // core 0
     );
+    if (worker_ok != pdPASS) {
+        // Without the worker the queue would fill and the result would never
+        // arrive; fail cleanly instead of hanging in xSemaphoreTake().
+        setCpuFrequencyMhz(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+        vQueueDelete(shared.queue);
+        vSemaphoreDelete(shared.done_sem);
+        reader.deinit();
+        wf.close();
+        displayError("Crack task alloc failed", true);
+        return;
+    }
 
     padprintln("Recovering...");
     padprintln("(Press SEL to abort)");
@@ -1073,10 +1087,17 @@ void wifi_crack_handshake(const String &wordlist_path, const String &pcap_path) 
         }
     }
 
+    // Ask the worker to drain anything still queued and then stop.  The
+    // sentinel send can fail while the queue is full (user aborted), so retry
+    // until it is accepted, and wait for the worker before deleting its
+    // queue/semaphore.  The old 5 s timeout could free objects still in use.
+    shared.abort = true;
     PwEntry sentinel;
     sentinel.len = 0;
-    xQueueSend(shared.queue, &sentinel, pdMS_TO_TICKS(500));
-    xSemaphoreTake(shared.done_sem, pdMS_TO_TICKS(5000));
+    while (xQueueSend(shared.queue, &sentinel, pdMS_TO_TICKS(100)) != pdTRUE) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    xSemaphoreTake(shared.done_sem, portMAX_DELAY);
 
     vQueueDelete(shared.queue);
     vSemaphoreDelete(shared.done_sem);

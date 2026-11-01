@@ -299,6 +299,10 @@ void nrf_spectrum() {
                 tft.fillRect(0, spec_barAreaY, tftWidth, spec_barAreaH, bruceConfig.bgColor);
                 delay(200);
             }
+
+            // scanChannels() never blocks.  Yield explicitly so the idle task
+            // can feed the task watchdog during long spectrum sessions.
+            vTaskDelay(1 / portTICK_PERIOD_MS);
         }
 
         NRFradio.stopListening();

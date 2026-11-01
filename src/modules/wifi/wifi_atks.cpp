@@ -224,7 +224,18 @@ void wifi_atk_info(String tssid, String mac, uint8_t channel) {
 bool wifi_atk_setWifi() {
     checkHeap("Wifi atk start");
 
-    if (WiFi.getMode() != WIFI_MODE_NULL) { return true; }
+    // Any WiFi feature that stops/reconfigures the radio must first tear down
+    // the WebUI; otherwise in-flight AsyncTCP callbacks touch a stopped
+    // interface and reboot the device.
+    cleanlyStopWebUiForWiFiFeature();
+
+    // Attacks transmit through the AP interface.  A plain STA connection is
+    // not enough, even though it is a non-NULL WiFi mode.
+    if (WiFi.getMode() == WIFI_MODE_APSTA &&
+        (WiFi.softAPSSID() == WIFI_ATK_NAME || WiFi.softAPSSID() == bruceConfig.wifiAp.ssid)) {
+        wifiConnected = true;
+        return true;
+    }
 
     wifi_complete_cleanup();
     delay(100);
@@ -240,11 +251,13 @@ bool wifi_atk_setWifi() {
     if (WiFi.softAPSSID() != bruceConfig.wifiAp.ssid && WiFi.softAPSSID() != WIFI_ATK_NAME) {
         uint8_t randomChannel = random(1, 12);
         if (!WiFi.softAP(WIFI_ATK_NAME, emptyString, randomChannel, 1, 4, false)) {
+            wifiConnected = false;
             displayError("Failed starting  AP Attacker", true);
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    wifiConnected = true;
     return true;
 }
 
@@ -296,11 +309,20 @@ void wifi_atk_menu() {
     if (scanAtks) {
         int nets;
         displayTextLine("Scanning..");
+        WiFi.scanDelete();
         // include hidden networks in the scan depending on toggle
         nets = WiFi.scanNetworks(false, showHiddenNetworks);
         ap_records.clear();
         options = {};
+        if (nets < 0) {
+            displayError("WiFi scan failed", true);
+            WiFi.scanDelete();
+            wifi_atk_unsetWifi();
+            return;
+        }
         for (int i = 0; i < nets; i++) {
+            if (options.size() >= 250) break;
+            if (WiFi.BSSID(i) == nullptr) continue;
             wifi_ap_record_t record;
             memset(&record, 0, sizeof(record));
             // copy bssid
@@ -322,9 +344,10 @@ void wifi_atk_menu() {
             ap_records.push_back(record);
 
             String ssid = WiFi.SSID(i);
+            String bssidStr = WiFi.BSSIDstr(i);
+            uint8_t ch = static_cast<uint8_t>(WiFi.channel(i));
             int encryptionType = WiFi.encryptionType(i);
             int32_t rssi = WiFi.RSSI(i);
-            int32_t ch = WiFi.channel(i);
             String encryptionPrefix = (encryptionType == WIFI_AUTH_OPEN) ? "" : "#";
             String encryptionTypeStr;
             switch (encryptionType) {
@@ -341,24 +364,24 @@ void wifi_atk_menu() {
             String displaySSID = ssid;
             if (displaySSID.length() == 0) {
                 // show the BSSID so user can recognize it
-                displaySSID = "<Hidden SSID> " + WiFi.BSSIDstr(i);
+                displaySSID = "<Hidden SSID> " + bssidStr;
             }
 
             String optionText = encryptionPrefix + displaySSID + " (" + String(rssi) + "|" +
                                 encryptionTypeStr + "|ch." + String(ch) + ")";
 
+            // Capture everything by value: the scan buffer is released before
+            // loopOptions() blocks, so WiFi.SSID(i) would no longer be valid.
+            int recordIndex = ap_records.size() - 1;
             options.push_back({optionText.c_str(), [=]() {
-                                   ap_record = ap_records[i];
-                                   target_atk_menu(
-                                       WiFi.SSID(i).c_str(),
-                                       WiFi.BSSIDstr(i),
-                                       static_cast<uint8_t>(WiFi.channel(i))
-                                   );
+                                   ap_record = ap_records[recordIndex];
+                                   target_atk_menu(ssid.c_str(), bssidStr, ch);
                                }});
         }
 
         addOptionToMainMenu();
 
+        WiFi.scanDelete();
         loopOptions(options);
         options.clear();
         ap_records.clear();
@@ -377,10 +400,26 @@ void deauthFloodAttack() {
     int nets;
 ScanNets:
     displayTextLine("Scanning..");
+    WiFi.scanDelete();
     // include hidden networks in the scan depending on toggle
     nets = WiFi.scanNetworks(false, showHiddenNetworks);
     ap_records.clear();
+    if (nets < 0) {
+        displayError("WiFi scan failed", true);
+        WiFi.scanDelete();
+        wifi_atk_unsetWifi();
+        returnToMenu = true;
+        return;
+    }
+    if (nets == 0) {
+        displayError("No networks found", true);
+        WiFi.scanDelete();
+        wifi_atk_unsetWifi();
+        returnToMenu = true;
+        return;
+    }
     for (int i = 0; i < nets; i++) {
+        if (WiFi.BSSID(i) == nullptr) continue;
         wifi_ap_record_t record;
         memset(&record, 0, sizeof(record));
         memcpy(record.bssid, WiFi.BSSID(i), 6);
@@ -394,6 +433,7 @@ ScanNets:
         }
         ap_records.push_back(record);
     }
+    WiFi.scanDelete();
     // Prepare deauth frame for each AP record
     memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
 
@@ -432,6 +472,10 @@ ScanNets:
         if (millis() - rescan_counter > 60000) goto ScanNets;
 
         if (check(EscPress)) break;
+
+        // Always yield; an empty AP list would otherwise spin here without
+        // feeding the idle task and trigger the task watchdog.
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
     wifi_atk_unsetWifi();
     returnToMenu = true;
@@ -553,7 +597,7 @@ void capture_handshake(String tssid, String mac, uint8_t channel) {
             writeHeader(hsFile);
             hsFile.close();
             // Register using the file path
-            SavedHS.insert(hsFilePath);
+            sniffer_mark_handshake_saved(hsFilePath);
             // Mark as ready to capture
             uint64_t apKey = 0;
             for (int i = 0; i < 6; ++i) { apKey = (apKey << 8) | bssid_array[i]; }
@@ -571,7 +615,7 @@ void capture_handshake(String tssid, String mac, uint8_t channel) {
         }
     } else {
         // File already exists: Add to SavedHS and mark as captured
-        SavedHS.insert(hsFilePath);
+        sniffer_mark_handshake_saved(hsFilePath);
         uint64_t apKey = 0;
         for (int i = 0; i < 6; ++i) { apKey = (apKey << 8) | bssid_array[i]; }
         markHandshakeReady(apKey);
@@ -619,7 +663,7 @@ void capture_handshake(String tssid, String mac, uint8_t channel) {
         BeaconList targetBeacon;
         memcpy(targetBeacon.MAC, bssid_array, 6);
         targetBeacon.channel = channel;
-        if (registeredBeacons.find(targetBeacon) != registeredBeacons.end()) { hasBeacons = true; }
+        if (sniffer_beacon_exists(targetBeacon)) { hasBeacons = true; }
 
         // Redraw whenever new EAPOL Frame arrives
         if (num_EAPOL > prevNumEAPOL) {
@@ -978,7 +1022,7 @@ void beaconAttack() {
     resetGlobalState();
     if (!wifi_atk_setWifi()) return;
 
-    int BeaconMode;
+    int BeaconMode = -1;
     String txt = "";
     String singleSSID = "";
     // create empty SSID
@@ -1016,15 +1060,25 @@ void beaconAttack() {
     addOptionToMainMenu();
     loopOptions(options);
 
+    // Esc/Back leaves BeaconMode at -1.  The old code then fell through with
+    // an uninitialized mode and could spin forever without a yield.
+    if (returnToMenu || BeaconMode < 0) {
+        wifi_atk_unsetWifi();
+        return;
+    }
+
     wifiConnected = true;
     String beaconFile = "";
     File file;
-    FS *fs;
+    FS *fs = nullptr;
 #if !defined(LITE_VERSION)
     // Get user input for single SSID mode
     if (BeaconMode == 4) {
         singleSSID = keyboard("BruceBeacon", 26, "Base SSID:");
-        if (singleSSID.length() == 0) { return; }
+        if (singleSSID.length() == 0) {
+            wifi_atk_unsetWifi();
+            return;
+        }
     }
 #endif
     if (BeaconMode != 3) {
@@ -1056,9 +1110,21 @@ void beaconAttack() {
                 addOptionToMainMenu();
 
                 loopOptions(options);
-                if (fs != nullptr) beaconFile = loopSD(*fs, true, "TXT");
-                else return;
+                if (fs == nullptr || returnToMenu) {
+                    wifi_atk_unsetWifi();
+                    return;
+                }
+                beaconFile = loopSD(*fs, true, "TXT");
+                if (beaconFile.length() == 0) {
+                    wifi_atk_unsetWifi();
+                    return;
+                }
                 file = fs->open(beaconFile, FILE_READ);
+                if (!file) {
+                    displayError("Cannot open SSID file", true);
+                    wifi_atk_unsetWifi();
+                    return;
+                }
                 beaconFile = file.readString();
                 beaconFile.replace("\r\n", "\n");
                 tft.drawPixel(0, 0, 0);
@@ -1071,9 +1137,11 @@ void beaconAttack() {
         }
 #endif
         if (check(EscPress) || returnToMenu) {
-            if (BeaconMode == 3) file.close();
+            if (BeaconMode == 3 && file) file.close();
             break;
         }
+        // Never allow a malformed/empty SSID list to create a busy loop.
+        vTaskDelay(5 / portTICK_PERIOD_MS);
     }
     wifi_atk_unsetWifi();
 }

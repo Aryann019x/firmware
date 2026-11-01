@@ -206,6 +206,15 @@ int8_t displayMessage(
     int8_t selected = 0; // Start at first available button
     bool redraw = true;
 
+    // A JavaScript caller may omit every button.  The selection code below
+    // uses modulo totalButtons, which would divide by zero and crash.
+    if (totalButtons <= 0) {
+        while (!check(SelPress) && !check(EscPress) && !check(AnyKeyPress)) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+        }
+        return 0;
+    }
+
     while (true) {
         if (check(PrevPress) || check(EscPress)) {
             selected = (selected - 1 + totalButtons) % totalButtons; // Cycle backward

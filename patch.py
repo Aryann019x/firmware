@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 import glob
 import gzip
+import subprocess
 from os import makedirs, remove, rename
 from os.path import basename, dirname, exists, isfile, join
 
@@ -16,47 +17,126 @@ Import("env")  # type: ignore
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32-libs")
 board_mcu = env.BoardConfig()
 mcu = board_mcu.get("build.mcu", "")
-patchflag_path = join(FRAMEWORK_DIR,mcu, "lib", ".patched")
+lib_dir = join(FRAMEWORK_DIR, mcu, "lib")
+patchflag_path = join(lib_dir, ".patched")
 
-# patch file only if we didn't do it befored
-if not isfile(join(FRAMEWORK_DIR,mcu, "lib", ".patched")):
-    original_file = join(FRAMEWORK_DIR,mcu, "lib", "libnet80211.a")
-    patched_file = join(
-        FRAMEWORK_DIR, mcu, "lib", "libnet80211.a.patched"
+
+def _find_tool(name, package):
+    """Return the full path of a tool from a PlatformIO package, or None."""
+    try:
+        pkg_dir = env.PioPlatform().get_package_dir(package)
+    except Exception:
+        return None
+    if not pkg_dir:
+        return None
+    for candidate in (name + ".exe", name):
+        path = join(pkg_dir, "bin", candidate)
+        if isfile(path):
+            return path
+    return None
+
+
+def _find_objcopy():
+    if mcu.startswith("esp32c") or mcu in ("esp32p4", "esp32h2"):
+        package = "toolchain-riscv32-esp"
+        names = ["riscv32-esp-elf-objcopy"]
+    else:
+        package = "toolchain-xtensa-esp-elf"
+        # Prefer the target-specific binary, fall back to the generic one.
+        names = ["xtensa-%s-elf-objcopy" % mcu, "xtensa-esp-elf-objcopy"]
+    for name in names:
+        path = _find_tool(name, package)
+        if path:
+            return path
+    return None
+
+
+def _symbol_is_weak(library):
+    """True when the deauth override symbol is already weak in the archive."""
+    nm = _find_tool("xtensa-%s-elf-nm" % mcu, "toolchain-xtensa-esp-elf") or _find_tool(
+        "riscv32-esp-elf-nm", "toolchain-riscv32-esp"
     )
+    if not nm:
+        return False
+    try:
+        out = subprocess.run(
+            [nm, "-A", library], capture_output=True, text=True, timeout=120
+        ).stdout
+    except Exception:
+        return False
+    for line in out.splitlines():
+        if "ieee80211_raw_frame_sanity_check" not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[-2] in ("W", "w", "V", "v"):
+            return True
+    return False
 
-    if mcu=="esp32c5" or mcu=="esp32c6" :
-        env.Execute(
-            "pio pkg exec -p toolchain-riscv32-esp -- riscv32-esp-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (original_file, patched_file)
+
+def _patch_net80211():
+    original_file = join(lib_dir, "libnet80211.a")
+    patched_file = join(lib_dir, "libnet80211.a.patched")
+    old_file = original_file + ".old"
+
+    # A previous broken run could leave only the .old copy behind.
+    if not isfile(original_file) and isfile(old_file):
+        rename(old_file, original_file)
+        print("Patch: restored libnet80211.a left behind by an earlier run")
+
+    if not isfile(original_file):
+        print("Patch: libnet80211.a not found, skipping symbol patch")
+        return
+
+    # The flag is only written after a verified patch, but validate it anyway
+    # so a manually restored library is re-patched instead of breaking the link.
+    if isfile(patchflag_path) and _symbol_is_weak(original_file):
+        return
+    if isfile(patchflag_path):
+        remove(patchflag_path)
+
+    objcopy = _find_objcopy()
+    if not objcopy:
+        print("Patch: objcopy not found, keeping original libnet80211.a")
+        return
+
+    try:
+        result = subprocess.run(
+            [
+                objcopy,
+                "--weaken-symbol=ieee80211_raw_frame_sanity_check",
+                original_file,
+                patched_file,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
-    elif mcu=="esp32p4":
-        """Do nothing"""
-    else:
-        env.Execute(
-            "pio pkg exec -p toolchain-xtensa-%s -- xtensa-%s-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (mcu, mcu, original_file, patched_file)
+    except Exception as exc:
+        print("Patch: objcopy failed: %s" % exc)
+        return
+
+    if result.returncode != 0 or not isfile(patched_file):
+        print(
+            "Patch: objcopy produced nothing, keeping the original library: %s"
+            % (result.stderr or result.stdout or "unknown error").strip()
         )
+        if isfile(patched_file):
+            remove(patched_file)
+        return
 
-    if isfile("%s.old" % (original_file)):
-        remove("%s.old" % (original_file))
+    # Only swap the library in once objcopy actually produced a patched copy.
+    if isfile(old_file):
+        remove(old_file)
+    rename(original_file, old_file)
+    rename(patched_file, original_file)
+    remove(old_file)
 
-    if isfile(original_file):
-        rename(original_file, "%s.old" % (original_file))
-    else:
-        print("Patch: Original file not found")
-
-    if isfile(patched_file):
-        rename(patched_file, original_file)
-    else:
-        print("Patch: Patched file not found")
+    with open(patchflag_path, "w") as fp:
+        fp.write("")
+    print("Patch: weakened ieee80211_raw_frame_sanity_check in libnet80211.a")
 
 
-    def _touch(path):
-        with open(path, "w") as fp:
-            fp.write("")
-
-    env.Execute(lambda *args, **kwargs: _touch(patchflag_path))
+_patch_net80211()
 
 
 def hash_file(file_path):

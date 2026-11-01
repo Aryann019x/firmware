@@ -192,6 +192,69 @@ void BruceConfigPins::fromJson(JsonObject obj) {
         count++;
         log_e("Fail");
     }
+    // One-time migration for the custom boards: early firmware builds saved IR
+    // pins that are physically wired to the display/touch (or are simply not
+    // exposed on the IR header).  Because the saved file always wins over the
+    // board defaults, those devices could never receive IR until the stale
+    // values were replaced.  The pinsRev marker makes this run only once, so a
+    // user can deliberately pick a Grove pin afterwards without it being
+    // overwritten on the next boot.
+    const bool pinsRevOld = (root["pinsRev"] | 0) < 2;
+    bool irPinsMigrated = false;
+    if (pinsRevOld) {
+#if defined(CC1101_SS_PIN) && defined(CC1101_GDO0_PIN)
+#if (CC1101_SS_PIN == 15) && (CC1101_GDO0_PIN == 6) && (RXLED == 1) && (TXLED == 2)
+        // ESP32-S3 custom boards used to save RX=9 (Grove W) together with the
+        // old TX default (40 on the first board revision, 8 from the generic
+        // fallback).  Move both to the real IR header independently, because
+        // an older save may have only one of the two values stale.
+        if (irRx == 9 || irRx == 8) {
+            irRx = RXLED;
+            irPinsMigrated = true;
+        }
+        if (irTx == 40 || irTx == 8 || irTx == 9) {
+            irTx = TXLED;
+            irPinsMigrated = true;
+        }
+#elif (CC1101_SS_PIN == 25) && (CC1101_GDO0_PIN == 13) && (RXLED == 2) && (TXLED == 2)
+        // ESP-WROOM32 custom boards used to save the Grove SCL/SDA defaults.
+        if (irRx == 21 || irRx == 22) {
+            irRx = RXLED;
+            irPinsMigrated = true;
+        }
+        if (irTx == 21 || irTx == 22) {
+            irTx = TXLED;
+            irPinsMigrated = true;
+        }
+#endif
+#endif
+    }
+    if (irPinsMigrated) {
+        count++;
+        log_i("IR pins migrated to RX=%d TX=%d", irRx, irTx);
+    }
+
+#if defined(CC1101_SS_PIN) && defined(CC1101_GDO0_PIN)
+    // Legacy custom-board configs saved the CC1101 CS/GDO0 on pins that are now
+    // used by the display/touch or by the NRF24.  Move only the known legacy
+    // values; explicit custom wiring is left untouched.
+    if (pinsRevOld) {
+        const bool legacyS3Cc1101 = ((gpio_num_t)CC1101_SS_PIN == (gpio_num_t)15 &&
+                                     (gpio_num_t)CC1101_GDO0_PIN == (gpio_num_t)6 &&
+                                     CC1101_bus.cs == (gpio_num_t)10 && CC1101_bus.io0 == (gpio_num_t)9);
+        const bool legacyWroomCc1101 = ((gpio_num_t)CC1101_SS_PIN == (gpio_num_t)25 &&
+                                        (gpio_num_t)CC1101_GDO0_PIN == (gpio_num_t)13 &&
+                                        CC1101_bus.cs == (gpio_num_t)15 && CC1101_bus.io0 == (gpio_num_t)13);
+        if (legacyS3Cc1101 || legacyWroomCc1101) {
+            CC1101_bus.cs = (gpio_num_t)CC1101_SS_PIN;
+            CC1101_bus.io0 = (gpio_num_t)CC1101_GDO0_PIN;
+            count++;
+            log_i("CC1101 pins migrated to CS=%d GDO0=%d", CC1101_bus.cs, CC1101_bus.io0);
+        }
+    }
+#endif
+
+    if (pinsRevOld) count++;
     validateConfig();
     if (count > 0) saveFile();
 }
@@ -200,6 +263,7 @@ void BruceConfigPins::toJson(JsonObject obj) const {
     JsonObject root = obj[getMacAddress()].to<JsonObject>();
 
     root["rot"] = rotation;
+    root["pinsRev"] = 2;
     root["irTx"] = irTx;
     root["irTxRepeats"] = irTxRepeats;
     root["irRx"] = irRx;
@@ -340,6 +404,14 @@ void BruceConfigPins::validateConfig() {
     validateRfModuleValue();
     validateRfidModuleValue();
     validateGpsBaudrateValue();
+
+    // A corrupt or legacy config can contain GPIO_NUM_NC (or an out-of-range
+    // number) for the IR/RF pins.  Those values reach gpio_reset_pin() in
+    // setup_ir_pin() and would abort.  Fall back to the board defaults.
+    if (irTx < 0 || irTx >= GPIO_PIN_COUNT) irTx = TXLED;
+    if (irRx < 0 || irRx >= GPIO_PIN_COUNT) irRx = RXLED;
+    if (rfTx < -1 || rfTx >= GPIO_PIN_COUNT) rfTx = GROVE_SDA;
+    if (rfRx < -1 || rfRx >= GPIO_PIN_COUNT) rfRx = GROVE_SCL;
 #if !defined(LITE_VERSION)
     validateSpiPins(LoRa_bus);
     validateSpiPins(W5500_bus);
@@ -358,7 +430,7 @@ void BruceConfigPins::setLoRaPins(SPIPins value) {
     saveFile();
 }
 void BruceConfigPins::setW5500Pins(SPIPins value) {
-    LoRa_bus = value;
+    W5500_bus = value;
     validateSpiPins(W5500_bus);
     saveFile();
 }
@@ -381,37 +453,39 @@ void BruceConfigPins::setSDCardPins(SPIPins value) {
     saveFile();
 }
 
-void BruceConfigPins::setSpiPins(SPIPins value) {
+void BruceConfigPins::setSpiPins(SPIPins &value) {
+    // value is the live bus object from setSPIPinsMenu(); validate in place so
+    // out-of-range GPIOs are actually corrected instead of only in a copy.
     validateSpiPins(value);
     saveFile();
 }
 
-void BruceConfigPins::setI2CPins(I2CPins value) {
+void BruceConfigPins::setI2CPins(I2CPins &value) {
     validateI2CPins(value);
     saveFile();
 }
 
-void BruceConfigPins::setUARTPins(UARTPins value) {
+void BruceConfigPins::setUARTPins(UARTPins &value) {
     validateUARTPins(value);
     saveFile();
 }
-void BruceConfigPins::validateSpiPins(SPIPins value) {
-    if (value.sck < 0 || value.sck > GPIO_PIN_COUNT) value.sck = GPIO_NUM_NC;
-    if (value.miso < 0 || value.miso > GPIO_PIN_COUNT) value.miso = GPIO_NUM_NC;
-    if (value.mosi < 0 || value.mosi > GPIO_PIN_COUNT) value.mosi = GPIO_NUM_NC;
-    if (value.cs < 0 || value.cs > GPIO_PIN_COUNT) value.cs = GPIO_NUM_NC;
-    if (value.io0 < 0 || value.io0 > GPIO_PIN_COUNT) value.io0 = GPIO_NUM_NC;
-    if (value.io2 < 0 || value.io2 > GPIO_PIN_COUNT) value.io2 = GPIO_NUM_NC;
+void BruceConfigPins::validateSpiPins(SPIPins &value) {
+    if (value.sck < 0 || value.sck >= GPIO_PIN_COUNT) value.sck = GPIO_NUM_NC;
+    if (value.miso < 0 || value.miso >= GPIO_PIN_COUNT) value.miso = GPIO_NUM_NC;
+    if (value.mosi < 0 || value.mosi >= GPIO_PIN_COUNT) value.mosi = GPIO_NUM_NC;
+    if (value.cs < 0 || value.cs >= GPIO_PIN_COUNT) value.cs = GPIO_NUM_NC;
+    if (value.io0 < 0 || value.io0 >= GPIO_PIN_COUNT) value.io0 = GPIO_NUM_NC;
+    if (value.io2 < 0 || value.io2 >= GPIO_PIN_COUNT) value.io2 = GPIO_NUM_NC;
 }
 
-void BruceConfigPins::validateI2CPins(I2CPins value) {
-    if (value.sda < 0 || value.sda > GPIO_PIN_COUNT) value.sda = GPIO_NUM_NC;
-    if (value.scl < 0 || value.scl > GPIO_PIN_COUNT) value.scl = GPIO_NUM_NC;
+void BruceConfigPins::validateI2CPins(I2CPins &value) {
+    if (value.sda < 0 || value.sda >= GPIO_PIN_COUNT) value.sda = GPIO_NUM_NC;
+    if (value.scl < 0 || value.scl >= GPIO_PIN_COUNT) value.scl = GPIO_NUM_NC;
 }
 
-void BruceConfigPins::validateUARTPins(UARTPins value) {
-    if (value.rx < 0 || value.rx > GPIO_PIN_COUNT) value.rx = GPIO_NUM_NC;
-    if (value.tx < 0 || value.tx > GPIO_PIN_COUNT) value.tx = GPIO_NUM_NC;
+void BruceConfigPins::validateUARTPins(UARTPins &value) {
+    if (value.rx < 0 || value.rx >= GPIO_PIN_COUNT) value.rx = GPIO_NUM_NC;
+    if (value.tx < 0 || value.tx >= GPIO_PIN_COUNT) value.tx = GPIO_NUM_NC;
 }
 
 void BruceConfigPins::setRotation(int value) {

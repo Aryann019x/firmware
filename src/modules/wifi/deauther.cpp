@@ -31,6 +31,7 @@
 
 // Função para obter o MAC do gateway (ORIGINAL - DON'T CHANGE)
 void getGatewayMAC(uint8_t gatewayMAC[6]) {
+    memset(gatewayMAC, 0, 6);
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         memcpy(gatewayMAC, ap_info.bssid, 6);
@@ -62,6 +63,7 @@ int getAPChannel(const uint8_t* target_bssid) {
 
     for (int i = 0; i < numNetworks; i++) {
         uint8_t* bssid_ptr = WiFi.BSSID(i);
+        if (bssid_ptr == nullptr) continue;
 
         if (macCompare(bssid_ptr, target_bssid)) {
             found_channel = WiFi.channel(i);
@@ -82,26 +84,36 @@ int getAPChannel(const uint8_t* target_bssid) {
 bool tryMonitorMode(uint8_t channel) {
     Serial.printf("[DEAUTH] Trying monitor mode on CH%d\n", channel);
 
-    wifi_mode_t current_mode;
+    wifi_mode_t current_mode = WIFI_MODE_STA;
     esp_wifi_get_mode(&current_mode);
 
-    esp_wifi_stop();
+    // The Arduino WiFi stack already called esp_wifi_init().  Re-initializing
+    // here returns ESP_ERR_WIFI_STATE and leaves the driver stopped, which made
+    // the old code fall through to the AP fallback every time.
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_NOT_INIT) {
+        Serial.printf("[DEAUTH] esp_wifi_stop failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
     delay(5);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_start();
+    if (err != ESP_OK) {
+        Serial.printf("[DEAUTH] failed to start STA: %s\n", esp_err_to_name(err));
+        esp_wifi_set_mode(current_mode);
+        esp_wifi_start();
+        return false;
+    }
 
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL
     };
     esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous(true);
-
-    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    err = esp_wifi_set_promiscuous(true);
+    if (err == ESP_OK) err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
-        Serial.printf("[DEAUTH] Failed to set channel: %d\n", err);
+        Serial.printf("[DEAUTH] Failed to set monitor mode: %s\n", esp_err_to_name(err));
 
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_mode(current_mode);

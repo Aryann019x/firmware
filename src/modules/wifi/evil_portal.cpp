@@ -9,29 +9,27 @@
 #include "esp_wifi.h"
 #include "wifi_atks.h"
 
-// Constructor with background mode support
 EvilPortal::EvilPortal(
     String tssid, uint8_t channel, bool deauth, bool verifyPwd, bool autoMode, bool backgroundMode
 )
     : apName(tssid), _channel(channel), _deauth(deauth), _verifyPwd(verifyPwd), _autoMode(autoMode),
-      _backgroundMode(backgroundMode), webServer(80) {
+      _backgroundMode(backgroundMode), webServer(80), _launchTime(millis()) {
     
-    // Store original WiFi state before making any changes
     _originalWifiMode = WiFi.getMode();
     _wifiWasConnected = (WiFi.status() == WL_CONNECTED);
     
     if (!setup()) return;
-    // Now stop WebUI cleanly before starting WiFi mode
     cleanlyStopWebUiForWiFiFeature();
     beginAP();
+    // beginAP() sets wifiConnected=false when the AP could not be started.
+    // Do not enter the portal loop with no AP interface.
+    if (!wifiConnected) return;
     if (!_backgroundMode) {
-        loop(); // Full UI loop for foreground mode
+        loop();
     }
-    // In background mode, caller manages heartbeat via processRequests()
 }
 
 EvilPortal::~EvilPortal() {
-    // Empty - all cleanup done in loop()
 }
 
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
@@ -58,6 +56,9 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
 }
 
 bool EvilPortal::setup() {
+    if (apGateway == IPAddress((uint32_t)0)) apGateway = IPAddress(192, 168, 4, 1);
+    if (apName.isEmpty()) apName = "Free Wifi";
+
     if (_autoMode) {
         if (apName.indexOf("router") != -1 || apName.indexOf("update") != -1 ||
             apName.indexOf("firmware") != -1 || _verifyPwd) {
@@ -115,10 +116,22 @@ void EvilPortal::beginAP() {
         drawMainBorderWithTitle("EVIL PORTAL");
         displayTextLine("Starting...");
     }
-    if (_verifyPwd) WiFi.mode(WIFI_MODE_APSTA);
-    else WiFi.mode(WIFI_MODE_AP);
-    WiFi.softAPConfig(apGateway, apGateway, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(apName, emptyString, _channel);
+    if (!WiFi.mode(_verifyPwd ? WIFI_MODE_APSTA : WIFI_MODE_AP)) {
+        Serial.println("[PORTAL] Failed to switch WiFi mode");
+        wifiConnected = false;
+        return;
+    }
+
+    if (!WiFi.softAPConfig(apGateway, apGateway, IPAddress(255, 255, 255, 0))) {
+        Serial.println("[PORTAL] softAPConfig failed");
+        wifiConnected = false;
+        return;
+    }
+    if (!WiFi.softAP(apName, emptyString, _channel)) {
+        Serial.printf("[PORTAL] softAP failed for SSID '%s' on ch%d\n", apName.c_str(), _channel);
+        wifiConnected = false;
+        return;
+    }
     wifiConnected = true;
 
     int tmp = millis();
@@ -235,30 +248,41 @@ void EvilPortal::setupRoutes() {
         }
     });
 
-    // Store handler pointer for cleanup
-    // Do not remove it on exit else it will cause system to crash
-    // it will be automatically "burned" when server is stopped
     _captiveHandler = new CaptiveRequestHandler(this);
     webServer.addHandler(_captiveHandler).setFilter(ON_AP_FILTER);
 }
 
 void EvilPortal::restartWiFi(bool reset) {
-    // Let server handle cleanup - just stop and restart
     webServer.end();
     dnsServer.stop();
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    
-    // Don't touch _captiveHandler - server owns it
-    _captiveHandler = nullptr;
-    
+
+    // wifiDisconnect() leaves the radio in WIFI_OFF, so the AP mode has to be
+    // selected again before softAP() is called.
     wifiDisconnect();
-    WiFi.softAP(apName, emptyString, _channel);
+    if (!WiFi.mode(_verifyPwd ? WIFI_MODE_APSTA : WIFI_MODE_AP)) {
+        Serial.println("[PORTAL] Failed to restore AP mode");
+        wifiConnected = false;
+        return;
+    }
+    if (!WiFi.softAPConfig(apGateway, apGateway, IPAddress(255, 255, 255, 0))) {
+        Serial.println("[PORTAL] softAPConfig failed on restart");
+        wifiConnected = false;
+        return;
+    }
+    if (!WiFi.softAP(apName, emptyString, _channel)) {
+        Serial.printf("[PORTAL] softAP failed on restart for '%s'\n", apName.c_str());
+        wifiConnected = false;
+        return;
+    }
+    wifiConnected = true;
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    
-    setupRoutes();  // This will create a new handler
+
+    // Routes and the captive handler were registered by beginAP(); adding them
+    // again would leak handlers and dispatch every request more than once.
     dnsServer.start(53, "*", WiFi.softAPIP());
     webServer.begin();
-    
+
     if (reset) resetCapturedCredentials();
 }
 
@@ -317,21 +341,15 @@ void EvilPortal::loop() {
                 displayTextLine("Shutting down...");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
-                // Stop web server first
                 webServer.end();
                 vTaskDelay(200 / portTICK_PERIOD_MS);
                 
-                // Stop DNS
                 dnsServer.stop();
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
-                // Restore original WiFi mode
                 WiFi.mode(_originalWifiMode);
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
-                // Stop wifi else it will stay on but not connected to any AP
-                // and the stack will get confused so no connect/disconnect option
-                // will be shown on wifi menu after and it will just waste battery
                 wifiDisconnect();
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
@@ -344,10 +362,14 @@ void EvilPortal::loop() {
             wifiDisconnect();
             verifyPass = false;
         }
+
+        // DNS is handled asynchronously by this core version, so this loop has
+        // nothing that blocks.  Without a delay it starves the idle task and
+        // trips the task watchdog when deauth is disabled.
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
-// Lightweight heartbeat for background mode
 void EvilPortal::processRequests() {
     if (!_backgroundMode) return;
     dnsServer.processNextRequest();
@@ -359,6 +381,52 @@ void EvilPortal::processRequests() {
 bool EvilPortal::hasCredentials() { return totalCapturedCredentials > 0; }
 
 String EvilPortal::getCapturedPassword() { return lastCred; }
+
+String EvilPortal::getCapturedSSID() { return apName; }
+
+void EvilPortal::setBaseDuration(uint16_t seconds) {
+    _baseDurationSec = seconds;
+}
+
+void EvilPortal::setExtendedDuration(uint16_t seconds) {
+    _extendedDurationSec = seconds;
+}
+
+bool EvilPortal::hasRecentActivity() {
+    if (totalCapturedCredentials > previousTotalCapturedCredentials) {
+        _lastActivityTime = millis();
+        return true;
+    }
+    return (millis() - _lastActivityTime < 5000);
+}
+
+bool EvilPortal::hasRecentPageView() {
+    return (millis() - _lastPageViewTime < 30000);
+}
+
+void EvilPortal::recordPageView() {
+    _lastPageViewTime = millis();
+}
+
+bool EvilPortal::shouldTerminate() {
+    unsigned long currentTime = millis();
+    unsigned long elapsed = currentTime - _launchTime;
+    
+    if (_durationExtended) {
+        return elapsed > (_extendedDurationSec * 1000);
+    } else {
+        return elapsed > (_baseDurationSec * 1000);
+    }
+}
+
+void EvilPortal::checkAndExtendDuration() {
+    if (_durationExtended) return;
+    
+    if (hasRecentActivity()) {
+        _durationExtended = true;
+        Serial.println("[PORTAL] Activity detected, extending duration");
+    }
+}
 
 void EvilPortal::drawScreen() {
     drawMainBorderWithTitle("EVIL PORTAL");
@@ -582,6 +650,7 @@ void EvilPortal::loadDefaultHtml() {
 }
 
 void EvilPortal::portalController(AsyncWebServerRequest *request) {
+    recordPageView();
     if (isDefaultHtml) request->send(200, "text/html", htmlPage);
     else { request->send(*fsHtmlFile, htmlFileName, "text/html"); }
 }

@@ -43,10 +43,12 @@ String generateToken(int length = 24) {
 void stopWebUi() {
     tft.setLogging(false);
     isWebUIActive = false;
-    server->end();
-    server->~AsyncWebServer();
-    free(server);
-    server = nullptr;
+    if (server != nullptr) {
+        // Keep the AsyncWebServer object alive.  Destroying it here raced with
+        // in-flight AsyncTCP callbacks (use-after-free -> reboot), and the
+        // routes would have to be registered again on the next start.
+        server->end();
+    }
     if (mdnsRunning) {
         MDNS.end();
         mdnsRunning = false;
@@ -59,10 +61,10 @@ void stopWebUi() {
 **  This prevents WiFi mode conflicts when features need exclusive control
 **********************************************************************/
 void cleanlyStopWebUiForWiFiFeature() {
-    // Only proceed if WebUI is active
-    if (!isWebUIActive && !server) {
-        return;
-    }
+    // Only proceed if WebUI is actually active.  `server` stays allocated for
+    // reuse, so testing it here would tear down an AP that belongs to another
+    // WiFi feature every time this helper is called.
+    if (!isWebUIActive) return;
 
     // Brief notification (non-blocking)
     Serial.println("Stopping WebUI for WiFi feature...");
@@ -751,24 +753,37 @@ void startWebUi(bool mode_ap) {
         else wifiConnectMenu(WIFI_STA);
     } else {
         keepWifiConnected = true;
+        wifiConnected = true;
     }
 
     // configure web server
+
+    if (!wifiConnected) {
+        displayError("WiFi not ready", true);
+        return;
+    }
 
     if (!server) {
         // Clear this vector to free stack memory
         options.clear();
 
         Serial.println("Configuring Webserver ...");
-        if (psramFound()) server = (AsyncWebServer *)ps_malloc(sizeof(AsyncWebServer));
-        else server = (AsyncWebServer *)malloc(sizeof(AsyncWebServer));
-
-        new (server) AsyncWebServer(default_webserverporthttp);
+        void *serverMem = psramFound() ? ps_malloc(sizeof(AsyncWebServer)) : malloc(sizeof(AsyncWebServer));
+        if (serverMem == nullptr) {
+            displayError("WebUI: out of memory", true);
+            return;
+        }
+        server = new (serverMem) AsyncWebServer(default_webserverporthttp);
 
         configureWebServer();
-
-        isWebUIActive = true;
+    } else if (!isWebUIActive) {
+        // Routes are still registered from the previous run: just reopen the
+        // listening socket instead of reallocating the whole server.
+        server->begin();
+        if (!mdnsRunning) mdnsRunning = startMdnsResponder();
+        Serial.println("Webserver restarted");
     }
+    isWebUIActive = true;
     tft.setLogging();
     drawWebUiScreen(mode_ap);
 #ifdef HAS_SCREEN // Headless always run in the background!

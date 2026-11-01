@@ -5,6 +5,7 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <set>
+#include <vector>
 
 struct HandshakeTracker {
     bool msg1 = false;
@@ -62,8 +63,17 @@ void sniffer_wait_for_flush(uint32_t timeoutMs = 2000);
 void sniffer_reset_handshake_cache();
 void markHandshakeReady(uint64_t key);
 
-extern std::set<BeaconList> registeredBeacons;
-extern std::set<String> SavedHS;
+// Beacon state is written from the WiFi sniffer callback and read from the UI
+// task.  The underlying containers are private to sniffer.cpp; use these
+// helpers instead of touching them directly.
+bool sniffer_lock_beacons(TickType_t timeout = pdMS_TO_TICKS(100));
+void sniffer_unlock_beacons();
+void sniffer_add_beacon(const BeaconList &beacon);
+bool sniffer_beacon_exists(const BeaconList &beacon);
+size_t sniffer_beacon_count();
+void sniffer_clear_beacons();
+std::vector<BeaconList> sniffer_copy_beacons();
+void sniffer_mark_handshake_saved(const String &path);
 
 void newPacketSD(uint32_t ts_sec, uint32_t ts_usec, uint32_t len, uint8_t *buf, File pcap_file);
 
